@@ -49,8 +49,12 @@ type Event struct {
 	ElClasses string
 	ElText    string
 	ElLabel   string
-	Rage      bool
-	Dead      bool
+	// ElComponent is the closest data-calor-component value; Components are
+	// the ids of the site's components containing the click.
+	ElComponent string
+	Components  []string
+	Rage        bool
+	Dead        bool
 
 	TargetURL     string
 	NavKind       string
@@ -105,9 +109,9 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) error {
 	ins, err := tx.PrepareContext(ctx, `INSERT INTO events (
 		site_id, type, page_url, session_id, pageview_id, ts, x, y,
 		viewport_w, viewport_h, doc_w, doc_h,
-		selector, el_tag, el_id, el_classes, el_text, el_label, rage, dead,
+		selector, el_tag, el_id, el_classes, el_text, el_label, el_component, rage, dead,
 		target_url, nav_kind, referrer, redirect_count, scroll_depth, duration_ms, received_at
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -119,6 +123,7 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) error {
 		return err
 	}
 	defer roll.Close()
+	var tag *sql.Stmt
 	now := time.Now().UnixMilli()
 	for i := range events {
 		e := &events[i]
@@ -132,11 +137,29 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) error {
 		if e.ScrollDepth != nil {
 			depth = *e.ScrollDepth
 		}
-		if _, err := ins.ExecContext(ctx, e.SiteID, e.Type, e.PageURL, e.SessionID, e.PageviewID, e.TS, x, y,
+		res, err := ins.ExecContext(ctx, e.SiteID, e.Type, e.PageURL, e.SessionID, e.PageviewID, e.TS, x, y,
 			e.ViewportW, e.ViewportH, e.DocW, e.DocH,
-			e.Selector, e.ElTag, e.ElID, e.ElClasses, e.ElText, e.ElLabel, b2i(e.Rage), b2i(e.Dead),
-			e.TargetURL, e.NavKind, e.Referrer, e.RedirectCount, depth, e.DurationMs, now); err != nil {
+			e.Selector, e.ElTag, e.ElID, e.ElClasses, e.ElText, e.ElLabel, e.ElComponent, b2i(e.Rage), b2i(e.Dead),
+			e.TargetURL, e.NavKind, e.Referrer, e.RedirectCount, depth, e.DurationMs, now)
+		if err != nil {
 			return err
+		}
+		if len(e.Components) > 0 {
+			if tag == nil {
+				if tag, err = tx.PrepareContext(ctx, `INSERT OR IGNORE INTO event_components (component_id, ts, event_id) VALUES (?,?,?)`); err != nil {
+					return err
+				}
+				defer tag.Close()
+			}
+			id, err := res.LastInsertId()
+			if err != nil {
+				return err
+			}
+			for _, c := range e.Components {
+				if _, err := tag.ExecContext(ctx, c, e.TS, id); err != nil {
+					return err
+				}
+			}
 		}
 		if e.Type == TypeClick || e.Type == TypeNavigation {
 			if gx, gy, ok := rollupCell(e); ok {
@@ -153,6 +176,15 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) error {
 // PruneEvents deletes raw events older than cutoff (unix ms). Heatmap rollups
 // are kept so long-range heatmaps survive raw-event retention.
 func (s *Store) PruneEvents(ctx context.Context, cutoff int64) (int64, error) {
+	ids, err := s.allComponentIDs(ctx, "")
+	if err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		if _, err := s.deleteChunked(ctx, "event_components", "component_id, ts, event_id", "component_id = ? AND ts < ?", id, cutoff); err != nil {
+			return 0, err
+		}
+	}
 	n, err := s.deleteChunked(ctx, "events", "rowid", "ts < ?", cutoff)
 	s.checkpoint(ctx)
 	return n, err
@@ -254,6 +286,15 @@ func (s *Store) DeleteSite(ctx context.Context, id string) error {
 			return ErrNotFound
 		}
 		return err
+	}
+	cids, err := s.allComponentIDs(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, cid := range cids {
+		if err := s.clearComponentTags(ctx, cid); err != nil {
+			return err
+		}
 	}
 	if _, err := s.deleteChunked(ctx, "events", "rowid", "site_id = ?", id); err != nil {
 		return err

@@ -77,8 +77,24 @@ func filterFrom(r *http.Request, siteID string) (store.Filter, error) {
 	return f, nil
 }
 
+// siteFilter is filterFrom plus the component filter, which must name one of
+// the site's components.
 func (s *Server) siteFilter(r *http.Request) (store.Filter, error) {
-	return filterFrom(r, siteFrom(r).ID)
+	f, err := filterFrom(r, siteFrom(r).ID)
+	if err != nil {
+		return f, err
+	}
+	if id := r.URL.Query().Get("component"); id != "" {
+		sc, err := s.comps.get(r.Context(), f.SiteID)
+		if err != nil {
+			return f, err
+		}
+		if !sc.ids[id] {
+			return f, httpError{http.StatusNotFound, "unknown component"}
+		}
+		f.Component = id
+	}
+	return f, nil
 }
 
 func requirePage(f store.Filter) error {

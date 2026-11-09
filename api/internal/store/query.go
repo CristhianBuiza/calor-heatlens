@@ -17,6 +17,9 @@ type Filter struct {
 	Types       []string
 	Device      string // mobile | tablet | desktop | "" (all)
 	TZOffsetMin int    // minutes east of UTC, for hour-of-day / day buckets
+	// Component restricts click events to those tagged with this component;
+	// other event types (pageviews, scroll, navigation) are left unscoped.
+	Component string
 }
 
 type cond struct {
@@ -47,7 +50,26 @@ func (f Filter) base(withPage bool) *cond {
 	if dc, ok := deviceCond("viewport_w", f.Device); ok {
 		c.add(dc)
 	}
+	if f.Component != "" {
+		sub, args := f.componentEvents()
+		c.add("(type <> 'click' OR id IN ("+sub+"))", args...)
+	}
 	return c
+}
+
+// componentEvents selects the ids of events tagged with f.Component in range.
+func (f Filter) componentEvents() (string, []any) {
+	q := "SELECT event_id FROM event_components WHERE component_id = ?"
+	args := []any{f.Component}
+	if f.From > 0 {
+		q += " AND ts >= ?"
+		args = append(args, f.From)
+	}
+	if f.To > 0 {
+		q += " AND ts < ?"
+		args = append(args, f.To)
+	}
+	return q, args
 }
 
 func placeholders(n int) string {
@@ -929,9 +951,12 @@ func heatTypes(types []string) []string {
 // size. Hour-aligned ranges are served from the pre-aggregated rollup table.
 func (s *Store) Heatmap(ctx context.Context, f Filter, cols, rows int) (Heatmap, error) {
 	types := heatTypes(f.Types)
+	if f.Component != "" {
+		types = []string{TypeClick}
+	}
 	h := Heatmap{Cols: cols, Rows: rows, Cells: []Cell{}}
 	const hour = 3_600_000
-	useRollup := f.From%hour == 0 && f.To%hour == 0
+	useRollup := f.From%hour == 0 && f.To%hour == 0 && f.Component == ""
 
 	var q string
 	var args []any

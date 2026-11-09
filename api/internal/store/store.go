@@ -117,9 +117,10 @@ func (s *Store) Close() error {
 	return err
 }
 
-const schemaVersion = 1
+// migrations[i] upgrades user_version i to i+1.
+var migrations = [][]string{schemaV1, schemaV2}
 
-var schema = []string{
+var schemaV1 = []string{
 	`CREATE TABLE IF NOT EXISTS sites (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
@@ -183,28 +184,56 @@ var schema = []string{
 	)`,
 }
 
+// Component tagging. event_components is keyed by component then time so a
+// component-scoped query reads one contiguous range; it has no foreign keys
+// so deletes can be chunked instead of cascading in one transaction.
+var schemaV2 = []string{
+	`ALTER TABLE events ADD COLUMN el_component TEXT NOT NULL DEFAULT ''`,
+	`CREATE TABLE IF NOT EXISTS components (
+		id TEXT PRIMARY KEY,
+		site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		name TEXT NOT NULL,
+		selector TEXT NOT NULL DEFAULT '',
+		attr_name TEXT NOT NULL DEFAULT '',
+		attr_value TEXT NOT NULL DEFAULT '',
+		page_pattern TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_components_site ON components(site_id, name)`,
+	`CREATE TABLE IF NOT EXISTS event_components (
+		component_id TEXT NOT NULL,
+		ts INTEGER NOT NULL,
+		event_id INTEGER NOT NULL,
+		PRIMARY KEY (component_id, ts, event_id)
+	) WITHOUT ROWID`,
+}
+
 func (s *Store) migrate(ctx context.Context) error {
 	var v int
 	if err := s.w.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
 		return err
 	}
-	if v >= schemaVersion {
-		return nil
-	}
-	tx, err := s.w.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, stmt := range schema {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migrate: %w", err)
+	for ; v < len(migrations); v++ {
+		tx, err := s.w.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		for _, stmt := range migrations[v] {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("migrate to v%d: %w", v+1, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", v+1)); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return nil
 }
 
 // DeviceOf classifies a viewport width.

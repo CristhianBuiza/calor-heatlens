@@ -59,6 +59,7 @@ type Server struct {
 	queue *Queue
 	cache *Cache
 	sites *siteRegistry
+	comps *compRegistry
 	mux   *http.ServeMux
 }
 
@@ -70,6 +71,7 @@ func New(st *store.Store, cfg Config) *Server {
 		queue: NewQueue(st, cfg.QueueBatches, cfg.FlushInterval, cfg.Logger),
 		cache: NewCache(cfg.CacheTTL, cfg.CacheEntries),
 		sites: &siteRegistry{st: st},
+		comps: &compRegistry{st: st},
 		mux:   http.NewServeMux(),
 	}
 	s.routes()
@@ -127,6 +129,16 @@ func (s *Server) routes() {
 	admin("POST /api/sites/{site}/screenshot", s.withSite(s.handlePutScreenshot))
 	admin("DELETE /api/sites/{site}/screenshot", s.withSite(s.handleDeleteScreenshot))
 	admin("GET /api/compare", s.cached(s.handleCompare))
+
+	admin("GET /api/sites/{site}/components", s.withSite(s.cached(s.handleListComponents)))
+	admin("POST /api/sites/{site}/components", s.withSite(s.handleCreateComponent))
+	admin("POST /api/sites/{site}/components/preview", s.withSite(s.handlePreviewComponent))
+	admin("GET /api/sites/{site}/components/discovered", s.withSite(s.cached(s.handleDiscoveredComponents)))
+	admin("GET /api/sites/{site}/components/{id}", s.withSite(s.cached(s.handleGetComponent)))
+	admin("PATCH /api/sites/{site}/components/{id}", s.withSite(s.handleUpdateComponent))
+	admin("DELETE /api/sites/{site}/components/{id}", s.withSite(s.handleDeleteComponent))
+	admin("GET /api/sites/{site}/components/{id}/stats", s.withSite(s.cached(s.handleComponentStats)))
+	m.HandleFunc("GET /api/sites/{site}/tracker-config", s.cors(s.handleTrackerConfig))
 
 	if s.cfg.TrackerDir != "" {
 		fs := http.StripPrefix("/tracker/", http.FileServer(http.Dir(filepath.Clean(s.cfg.TrackerDir))))

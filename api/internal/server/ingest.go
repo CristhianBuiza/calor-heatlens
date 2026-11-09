@@ -48,6 +48,7 @@ type wireEvent struct {
 	RC   int      `json:"rc"`
 	SD   *float64 `json:"sd"`
 	MS   int64    `json:"ms"`
+	Cmp  []string `json:"cmp"` // component ids the tracker matched in the browser
 }
 
 type wireEl struct {
@@ -57,6 +58,7 @@ type wireEl struct {
 	Cls  string `json:"cls"`
 	Txt  string `json:"txt"`
 	Aria string `json:"aria"`
+	CA   string `json:"ca"` // closest data-calor-component value
 }
 
 var (
@@ -160,15 +162,22 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 
 	res := ingestResult{}
 	events := make([]store.Event, 0, len(b.Events))
-	for _, we := range b.Events {
-		ev, ok := s.convert(&b, &we, site, base, backfill)
+	var cmp [][]string
+	for i := range b.Events {
+		we := &b.Events[i]
+		ev, ok := s.convert(&b, we, site, base, backfill)
 		if !ok || ev.TS < minTS || ev.TS > maxTS {
 			res.Rejected++
 			continue
 		}
 		events = append(events, ev)
+		if len(we.Cmp) > 20 {
+			we.Cmp = we.Cmp[:20]
+		}
+		cmp = append(cmp, we.Cmp)
 	}
 	if len(events) > 0 {
+		s.tagClicks(r.Context(), site.ID, events, cmp)
 		if err := s.queue.Enqueue(events); err != nil {
 			w.Header().Set("Retry-After", "5")
 			writeError(w, r, http.StatusServiceUnavailable, "ingest busy")
@@ -230,6 +239,7 @@ func (s *Server) convert(b *wireBatch, we *wireEvent, site store.Site, base int6
 		ev.ElClasses = clip(we.El.Cls, 200)
 		ev.ElText = clip(we.El.Txt, 120)
 		ev.ElLabel = clip(we.El.Aria, 120)
+		ev.ElComponent = clip(we.El.CA, 60)
 	}
 	if we.MS > 0 && we.MS < int64(24*time.Hour/time.Millisecond) {
 		ev.DurationMs = we.MS
