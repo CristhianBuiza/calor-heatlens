@@ -1,0 +1,14 @@
+node_modules/
+.next/
+dist/
+!tracker/dist/
+bin/
+*.db
+*.db-shm
+*.db-wal
+out/
+coverage/
+.env
+.env.local
+*.log
+e2e/output/
