@@ -144,9 +144,12 @@ func (s *Server) cors(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hd := w.Header()
 		hd.Set("Access-Control-Allow-Origin", "*")
-		hd.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		hd.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Calor-Backfill")
-		hd.Set("Access-Control-Max-Age", "86400")
+		// Browsers only read these on preflight; beacons never preflight.
+		if r.Method == http.MethodOptions {
+			hd.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			hd.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Calor-Backfill")
+			hd.Set("Access-Control-Max-Age", "86400")
+		}
 		h(w, r)
 	}
 }
@@ -261,7 +264,9 @@ func acceptsGzip(r *http.Request) bool {
 func writeRaw(w http.ResponseWriter, r *http.Request, status int, e *CacheEntry) {
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
-	h.Set("Vary", "Accept-Encoding")
+	if len(e.Raw) >= gzipMin {
+		h.Set("Vary", "Accept-Encoding")
+	}
 	if len(e.Raw) >= gzipMin && acceptsGzip(r) {
 		h.Set("Content-Encoding", "gzip")
 		w.WriteHeader(status)

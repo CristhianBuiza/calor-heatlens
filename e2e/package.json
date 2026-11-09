@@ -1,0 +1,16 @@
+{
+  "name": "@calor/e2e",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Seed data, live browser check, traffic capture and dashboard screenshots (drives an installed Chrome)",
+  "scripts": {
+    "seed": "node seed.mjs",
+    "live": "node live.mjs",
+    "screenshots": "node screenshots.mjs",
+    "measure": "node measure.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "25.16.0"
+  }
+}

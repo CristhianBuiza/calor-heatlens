@@ -1,7 +1,6 @@
 node_modules/
 .next/
 dist/
-!tracker/dist/
 bin/
 *.db
 *.db-shm
@@ -12,3 +11,5 @@ coverage/
 .env.local
 *.log
 e2e/output/
+data/
+*.tsbuildinfo

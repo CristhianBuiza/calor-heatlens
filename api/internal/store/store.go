@@ -24,9 +24,12 @@ const (
 
 // Options tune SQLite for small machines. Zero values pick conservative defaults.
 type Options struct {
-	CacheKiB     int // page cache per connection (default 8 MiB)
-	MmapBytes    int64
+	CacheKiB     int   // page cache per connection (default 4 MiB)
+	MmapBytes    int64 // 0 disables mmap: reads then go through the kernel page cache instead of counting toward RSS
 	MaxReadConns int
+	// SoftHeapBytes caps SQLite's own allocations process-wide (page caches,
+	// sorters); GOMEMLIMIT cannot see them. SQLite frees cache to stay under it.
+	SoftHeapBytes int64
 }
 
 type Store struct {
@@ -41,15 +44,13 @@ var ErrNotFound = errors.New("not found")
 // throwaway use; tests use a temp file so reader and writer share data.
 func Open(path string, opt Options) (*Store, error) {
 	if opt.CacheKiB <= 0 {
-		opt.CacheKiB = 8 * 1024
+		opt.CacheKiB = 4 * 1024
 	}
 	if opt.MmapBytes < 0 {
 		opt.MmapBytes = 0
-	} else if opt.MmapBytes == 0 {
-		opt.MmapBytes = 64 << 20
 	}
 	if opt.MaxReadConns <= 0 {
-		opt.MaxReadConns = 4
+		opt.MaxReadConns = 2
 	}
 	if path != ":memory:" {
 		abs, err := filepath.Abs(path)
@@ -67,6 +68,9 @@ func Open(path string, opt Options) (*Store, error) {
 		fmt.Sprintf("mmap_size(%d)", opt.MmapBytes),
 		"journal_size_limit(67108864)",
 		"temp_store(FILE)",
+	}
+	if opt.SoftHeapBytes > 0 {
+		pragmas = append(pragmas, fmt.Sprintf("soft_heap_limit(%d)", opt.SoftHeapBytes))
 	}
 	dsn := "file:" + path + "?"
 	for i, p := range pragmas {

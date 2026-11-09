@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -379,12 +380,22 @@ func TestDevicesAndSiteDelete(t *testing.T) {
 	if len(devs) != 2 || devs[0].Share != 50 {
 		t.Fatalf("devices: %+v", devs)
 	}
+	mustInsert(t, s, click("a", page, "s1", "p1", t0+1000, 10, 10), click("a", page, "s1", "p1", t0+2000, 300, 900))
+	defer func(n int) { deleteChunk = n }(deleteChunk)
+	deleteChunk = 1 // exercise the chunk loop
 	if err := s.DeleteSite(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
 	k, _ := s.KPIs(ctx, Filter{SiteID: "a"})
-	if k.Pageviews != 0 {
-		t.Errorf("events should cascade-delete with the site: %+v", k)
+	if k.Pageviews != 0 || k.Clicks != 0 {
+		t.Errorf("events should be deleted with the site: %+v", k)
+	}
+	var rollups int
+	if err := s.w.QueryRow(`SELECT COUNT(*) FROM heatmap_rollup WHERE site_id = 'a'`).Scan(&rollups); err != nil || rollups != 0 {
+		t.Errorf("rollups left after delete: %d %v", rollups, err)
+	}
+	if err := s.DeleteSite(ctx, "a"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("second delete: %v, want ErrNotFound", err)
 	}
 }
 

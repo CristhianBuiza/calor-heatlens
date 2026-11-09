@@ -1,0 +1,32 @@
+[Unit]
+Description=Calor dashboard (Next.js standalone)
+After=network.target calor-api.service
+Wants=calor-api.service
+
+[Service]
+Type=simple
+User=calor
+Group=calor
+WorkingDirectory=/opt/calor/dashboard/.next/standalone
+# Old-space cap keeps V8 from growing the heap toward the machine's RAM.
+ExecStart=/usr/bin/node --max-old-space-size=192 server.js
+# CALOR_ADMIN_KEY=..., optional DASHBOARD_USER / DASHBOARD_PASSWORD.
+EnvironmentFile=/etc/calor/calor.env
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+Environment=CALOR_API_URL=http://127.0.0.1:8080
+# Public URL of the API, used in the embed snippet shown on /sites.
+Environment=CALOR_PUBLIC_API_URL=https://calor.example.com
+MemoryHigh=256M
+MemoryMax=320M
+TasksMax=64
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

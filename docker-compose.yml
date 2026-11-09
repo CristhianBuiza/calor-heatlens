@@ -1,0 +1,39 @@
+# Low-memory deployment: both services fit in well under 1 GiB.
+#   CALOR_ADMIN_KEY=change-me docker compose up -d --build
+services:
+  api:
+    build:
+      context: .
+      dockerfile: deploy/api.Dockerfile
+    environment:
+      CALOR_ADMIN_KEY: ${CALOR_ADMIN_KEY:?set CALOR_ADMIN_KEY}
+      GOMEMLIMIT: 192MiB
+      CALOR_RETENTION_DAYS: ${CALOR_RETENTION_DAYS:-90}
+    volumes:
+      - calor-data:/data
+    ports:
+      - "8080:8080"
+    mem_limit: 320m
+    memswap_limit: 320m
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: deploy/dashboard.Dockerfile
+    environment:
+      CALOR_API_URL: http://api:8080
+      CALOR_PUBLIC_API_URL: ${CALOR_PUBLIC_API_URL:-http://localhost:8080}
+      CALOR_ADMIN_KEY: ${CALOR_ADMIN_KEY}
+      DASHBOARD_USER: ${DASHBOARD_USER:-}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
+    ports:
+      - "3000:3000"
+    mem_limit: 320m
+    memswap_limit: 320m
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  calor-data:

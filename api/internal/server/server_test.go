@@ -106,6 +106,9 @@ func TestIngestBeaconTextPlainAndCORS(t *testing.T) {
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Errorf("CORS header = %q", got)
 	}
+	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "" {
+		t.Errorf("preflight-only header on a simple POST: %q", got)
+	}
 	res := decode[ingestResult](t, rec)
 	if res.Accepted != 5 || res.Rejected != 0 {
 		t.Fatalf("result %+v", res)

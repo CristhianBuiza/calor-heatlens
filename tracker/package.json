@@ -1,0 +1,14 @@
+{
+  "name": "@calor/tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Calor heatmap tracking snippet (zero runtime dependencies)",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "demo": "node demo/serve.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

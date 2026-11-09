@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base32"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -152,11 +153,34 @@ func (s *Store) InsertEvents(ctx context.Context, events []Event) error {
 // PruneEvents deletes raw events older than cutoff (unix ms). Heatmap rollups
 // are kept so long-range heatmaps survive raw-event retention.
 func (s *Store) PruneEvents(ctx context.Context, cutoff int64) (int64, error) {
-	res, err := s.w.ExecContext(ctx, `DELETE FROM events WHERE ts < ?`, cutoff)
-	if err != nil {
-		return 0, err
+	n, err := s.deleteChunked(ctx, "events", "rowid", "ts < ?", cutoff)
+	s.checkpoint(ctx)
+	return n, err
+}
+
+// deleteChunk bounds rows per delete transaction: one huge DELETE would grow
+// the WAL to the size of everything it touches and block ingest meanwhile.
+var deleteChunk = 5000
+
+func (s *Store) deleteChunked(ctx context.Context, table, key, where string, args ...any) (int64, error) {
+	q := `DELETE FROM ` + table + ` WHERE (` + key + `) IN (SELECT ` + key + ` FROM ` + table + ` WHERE ` + where + ` LIMIT ` + strconv.Itoa(deleteChunk) + `)`
+	var total int64
+	for {
+		res, err := s.w.ExecContext(ctx, q, args...)
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
+		if n < int64(deleteChunk) {
+			return total, nil
+		}
 	}
-	return res.RowsAffected()
+}
+
+// checkpoint folds the WAL back into the database and truncates it; best effort.
+func (s *Store) checkpoint(ctx context.Context) {
+	_, _ = s.w.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
 }
 
 // ---- sites ----
@@ -224,13 +248,23 @@ func (s *Store) UpdateSite(ctx context.Context, site Site) (Site, error) {
 }
 
 func (s *Store) DeleteSite(ctx context.Context, id string) error {
-	res, err := s.w.ExecContext(ctx, `DELETE FROM sites WHERE id = ?`, id)
-	if err != nil {
+	var one int
+	if err := s.w.QueryRowContext(ctx, `SELECT 1 FROM sites WHERE id = ?`, id).Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
+	if _, err := s.deleteChunked(ctx, "events", "rowid", "site_id = ?", id); err != nil {
+		return err
 	}
+	if _, err := s.deleteChunked(ctx, "heatmap_rollup", "site_id, page_url, type, device, hour, gx, gy", "site_id = ?", id); err != nil {
+		return err
+	}
+	if _, err := s.w.ExecContext(ctx, `DELETE FROM sites WHERE id = ?`, id); err != nil {
+		return err
+	}
+	s.checkpoint(ctx)
 	return nil
 }
 

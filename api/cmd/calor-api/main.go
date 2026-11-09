@@ -42,9 +42,10 @@ func main() {
 	}
 
 	st, err := store.Open(env("CALOR_DB_PATH", "calor.db"), store.Options{
-		CacheKiB:     envInt("CALOR_SQLITE_CACHE_KB", 8192),
-		MmapBytes:    int64(envInt("CALOR_SQLITE_MMAP_MB", 64)) << 20,
-		MaxReadConns: envInt("CALOR_DB_READERS", 4),
+		CacheKiB:      envInt("CALOR_SQLITE_CACHE_KB", 4096),
+		MmapBytes:     int64(envInt("CALOR_SQLITE_MMAP_MB", 0)) << 20,
+		MaxReadConns:  envInt("CALOR_DB_READERS", 2),
+		SoftHeapBytes: int64(envInt("CALOR_SQLITE_HEAP_MB", 64)) << 20,
 	})
 	if err != nil {
 		logger.Fatalf("open store: %v", err)
