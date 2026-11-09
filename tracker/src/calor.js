@@ -19,6 +19,7 @@
   var MAX_BATCH = +opt('max-batch', 'maxBatch') || 25;
   if (opt('respect-dnt', 'respectDnt') != null && (navigator.doNotTrack == '1' || w.doNotTrack == '1')) return;
 
+  var CA = 'data-calor-component';
   var INTERACTIVE = 'a,button,input,select,textarea,label,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[onclick],[contenteditable],[tabindex]';
   var queue = [];
   var recent = [];
@@ -85,9 +86,9 @@
     if (queue.length) flush();
   }
 
-  function classes(el) {
+  function classes(el, n) {
     var c = el.getAttribute('class');
-    return c ? c.trim().split(/\s+/).slice(0, 3).join(' ') : '';
+    return c ? c.trim().split(/\s+/).slice(0, n).join(' ') : '';
   }
   function esc(s) { return w.CSS && CSS.escape ? CSS.escape(s) : s; }
 
@@ -96,7 +97,7 @@
     for (var n = el, i = 0; n && n.nodeType === 1 && i < 5; n = n.parentElement, i++) {
       var s = n.tagName.toLowerCase();
       if (n.id) { parts.unshift(s + '#' + esc(n.id)); break; }
-      var c = classes(n);
+      var c = classes(n, 2);
       if (c) s += '.' + c.split(' ').slice(0, 2).map(esc).join('.');
       var p = n.parentElement, same = 0, idx = 0;
       if (p) for (var k = p.firstElementChild; k; k = k.nextElementSibling) {
@@ -110,7 +111,7 @@
   }
 
   function describe(el) {
-    var tag = el.tagName.toLowerCase(), o = { sel: selector(el), tag: tag }, c = classes(el);
+    var tag = el.tagName.toLowerCase(), o = { sel: selector(el), tag: tag }, c = classes(el, 6);
     if (el.id) o.id = el.id;
     if (c) o.cls = c;
     var txt = /^(input|textarea|select)$/.test(tag)
@@ -120,7 +121,44 @@
     if (txt) o.txt = txt;
     var aria = el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('alt');
     if (aria) o.aria = clip(aria, 80);
+    var ca = el.closest('[' + CA + ']');
+    if (ca) o.ca = clip(ca.getAttribute(CA), 60);
     return o;
+  }
+
+  // Component rules: [id, selector, page glob]. Embedded via
+  // CalorConfig.components / data-components (JSON), else fetched once per
+  // session; data-components="off" disables selector matching.
+  var comps = [], CFG = 'calor_cfg';
+  function glob(p) {
+    return !p || new RegExp('^' + p.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$').test(location.pathname);
+  }
+  function match(el) {
+    var ids = [];
+    for (var i = 0; i < comps.length; i++) {
+      try {
+        if (glob(comps[i][2]) && el.closest(comps[i][1])) ids.push(comps[i][0]);
+      } catch (e) {}
+    }
+    return ids;
+  }
+  var emb = opt('components', 'components');
+  if (emb && emb !== 'off') {
+    try { comps = typeof emb == 'string' ? JSON.parse(emb) : emb; } catch (e) {}
+  } else if (!emb && w.fetch) {
+    try {
+      var cached = JSON.parse(sessionStorage.getItem(CFG) || 0);
+      if (cached && cached.s === site && now() - cached.t < 3e5) comps = cached.c;
+    } catch (e) {}
+    if (!cached || cached.s !== site || now() - cached.t >= 3e5) try {
+      fetch(new URL('/api/sites/' + encodeURIComponent(site) + '/tracker-config', new URL(endpoint, location.href)).href, { credentials: 'omit' })
+        .then(function (r) { return r.ok && r.json(); })
+        .then(function (j) {
+          if (!j) return;
+          comps = j.c || [];
+          try { sessionStorage.setItem(CFG, JSON.stringify({ s: site, t: now(), c: comps })); } catch (e) {}
+        })['catch'](function () {});
+    } catch (e) {}
   }
 
   function onClick(e) {
@@ -142,7 +180,8 @@
       if (Math.abs(recent[i][0] - x) < 30 && Math.abs(recent[i][1] - y) < 30) n++;
     }
     recent.push([x, y, ts]);
-    var ev = { t: 'c', x: x, y: y, dw: docW(), dh: docH(), el: describe(el) };
+    var ev = { t: 'c', x: x, y: y, dw: docW(), dh: docH(), el: describe(el) }, ids = match(t);
+    if (ids.length) ev.cmp = ids;
     if (n >= 3) ev.rage = 1;
     if (!hit) ev.dead = 1;
     push(ev);
@@ -240,5 +279,5 @@
   setInterval(flush, FLUSH_MS);
 
   startPV('load', d.referrer);
-  w.calor = { v: 1, flush: flush, sessionId: sid, describe: describe };
+  w.calor = { v: 1, flush: flush, sessionId: sid, describe: describe, match: match };
 })(window, document);

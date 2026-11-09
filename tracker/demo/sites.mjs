@@ -78,7 +78,7 @@ const acme = {
   footer: [['/about', 'Our story'], ['https://instagram.com/acmecoffee', 'Instagram'], ['/contact', 'Wholesale']],
 };
 const slug = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-const product = (name, notes, price) => `<div class="card"><div class="thumb"></div><h3><a href="/products/${slug(name)}" style="text-decoration:none">${name}</a></h3><p>${notes}</p>
+const product = (name, notes, price) => `<div class="card" data-calor-component="product-card"><div class="thumb"></div><h3><a href="/products/${slug(name)}" style="text-decoration:none">${name}</a></h3><p>${notes}</p>
 <div class="row" style="justify-content:space-between"><span class="price">$${price}</span><button class="btn primary small add-to-cart">Add to cart</button></div></div>`;
 acme.pages = {
   '/': ['Fresh roasted coffee', `
@@ -95,7 +95,7 @@ ${product('Ethiopia Guji', 'Peach, jasmine, bergamot', 19)}${product('Colombia H
 <div><h3>Free shipping over $35</h3><p>Carbon-neutral delivery anywhere in the US, always free for subscribers.</p></div>
 </div></div></section>
 <section><div class="wrap"><p class="quote">“The Guji changed how I think about coffee. It tastes like a peach orchard.”</p><p class="muted">— Dana R., subscriber since 2023</p></div></section>
-<section><div class="wrap card"><h2>Get 15% off your first bag</h2><p class="muted">Brew tips, new arrivals and roaster's notes, twice a month.</p>
+<section><div class="wrap card" data-calor-component="newsletter-signup"><h2>Get 15% off your first bag</h2><p class="muted">Brew tips, new arrivals and roaster's notes, twice a month.</p>
 <form class="row" onsubmit="event.preventDefault()"><input class="field" type="email" placeholder="you@example.com" name="email"><button class="btn primary" type="submit">Subscribe</button></form></div></section>`],
   '/shop': ['Shop', `
 <div class="wrap" style="padding-top:48px"><h1 style="font-family:Georgia,serif;font-size:42px;margin:0 0 20px">All coffee</h1>
@@ -116,7 +116,7 @@ ${product('Kenya Nyeri', 'Blackcurrant, grapefruit', 21)}${product('Guatemala An
 ${paras(4)}<h2>What you need</h2>${paras(3, 2)}<h2>Step by step</h2>${paras(5, 1)}<p><a class="btn primary" href="/shop">Shop pour-over coffees</a></p></article>`],
   '/about': ['About', `<article class="post"><div class="eyebrow">Our story</div><h1>Started in a garage in 2014.</h1><div class="cover"></div>${paras(6)}</article>`],
   '/cart': ['Cart', `<div class="wrap" style="padding:56px 32px"><h1 style="font-family:Georgia,serif">Your cart</h1>
-<div class="card" style="max-width:640px"><div class="row" style="justify-content:space-between"><span>Ethiopia Guji × 1</span><b>$19.00</b></div><hr style="border:0;border-top:1px solid #eadfd3;margin:16px 0">
+<div class="card" style="max-width:640px" data-calor-component="cart-summary"><div class="row" style="justify-content:space-between"><span>Ethiopia Guji × 1</span><b>$19.00</b></div><hr style="border:0;border-top:1px solid #eadfd3;margin:16px 0">
 <div class="row" style="justify-content:space-between"><span>House Espresso × 1</span><b>$16.00</b></div><hr style="border:0;border-top:1px solid #eadfd3;margin:16px 0">
 <div class="row" style="justify-content:space-between;margin-bottom:20px"><span class="muted">Free shipping applied</span><b>$35.00</b></div>
 <div class="row"><button class="btn primary checkout">Checkout</button><a class="btn ghost" href="/shop">Keep shopping</a></div></div></div>`],
@@ -176,9 +176,9 @@ nimbus.pages = {
 <div class="wrap hero" style="padding-bottom:20px;text-align:center"><h1 style="margin:0 auto 14px">Simple pricing that scales with you</h1><p class="lead" style="margin:0 auto 26px">Every plan includes unlimited viewers.</p>
 <div class="chips" style="justify-content:center"><button class="chip on" role="tab">Monthly</button><button class="chip" role="tab">Yearly · save 20%</button></div></div>
 <section style="padding-top:0"><div class="wrap grid g3">
-<div class="card"><h3>Starter</h3><p>For small teams getting started.</p><div class="price">$29 / mo</div><a class="btn ghost" href="/signup">Start trial</a></div>
-<div class="card" style="border:2px solid #4f46e5"><h3>Team</h3><p>Alerts, digests and 20 editors.</p><div class="price">$99 / mo</div><a class="btn primary" href="/signup">Start trial</a></div>
-<div class="card"><h3>Enterprise</h3><p>SSO, audit logs, dedicated support.</p><div class="price">Custom</div><a class="btn ghost" href="/demo">Contact sales</a></div>
+<div class="card" data-calor-component="pricing-card"><h3>Starter</h3><p>For small teams getting started.</p><div class="price">$29 / mo</div><a class="btn ghost" href="/signup">Start trial</a></div>
+<div class="card" style="border:2px solid #4f46e5" data-calor-component="pricing-card"><h3>Team</h3><p>Alerts, digests and 20 editors.</p><div class="price">$99 / mo</div><a class="btn primary" href="/signup">Start trial</a></div>
+<div class="card" data-calor-component="pricing-card"><h3>Enterprise</h3><p>SSO, audit logs, dedicated support.</p><div class="price">Custom</div><a class="btn ghost" href="/demo">Contact sales</a></div>
 </div></section>
 <section><div class="wrap" style="max-width:780px"><h2>Frequently asked questions</h2>
 <details><summary>What counts as an editor?</summary><p>Anyone who can create or change dashboards.</p></details>
@@ -222,8 +222,8 @@ const fieldnote = {
 const postCard = (slug, title, blurb, mins) => `<div class="card"><div class="thumb"></div><div class="eyebrow">${mins} min read</div><h3><a href="/posts/${slug}" style="text-decoration:none">${title}</a></h3><p>${blurb}</p><a class="read-more" href="/posts/${slug}">Read the story →</a></div>`;
 const post = (title, eyebrow, n) => `<article class="post"><div class="eyebrow">${eyebrow}</div><h1>${title}</h1><p class="muted">By Maya Lindqvist · March 2026</p><div class="cover"></div>
 ${paras(4)}<h2>Arriving</h2>${paras(n, 1)}<h2>Where we stayed</h2>${paras(n, 2)}<h2>What we'd do again</h2>${paras(n, 3)}
-<div class="card row" style="justify-content:space-between;margin-top:36px"><span>Enjoyed this? Get the next story by email.</span><a class="btn primary" href="/newsletter">Subscribe</a></div>
-<div class="row" style="margin-top:20px"><button class="btn small ghost share" aria-label="Share on X">Share</button><button class="btn small ghost copy-link">Copy link</button><a class="btn small ghost" href="/">More stories</a></div></article>`;
+<div class="card row" style="justify-content:space-between;margin-top:36px" data-calor-component="post-subscribe"><span>Enjoyed this? Get the next story by email.</span><a class="btn primary" href="/newsletter">Subscribe</a></div>
+<div class="row" style="margin-top:20px" data-calor-component="share-bar"><button class="btn small ghost share" aria-label="Share on X">Share</button><button class="btn small ghost copy-link">Copy link</button><a class="btn small ghost" href="/">More stories</a></div></article>`;
 fieldnote.pages = {
   '/': ['Stories', `<div class="wrap hero" style="padding-bottom:30px"><div class="eyebrow">Fieldnote Journal</div><h1>Slow travel, written down.</h1><p class="lead">Long-form stories from trains, trails and small kitchens. A new story every other Sunday.</p>
 <div class="ctas"><a class="btn primary" href="/posts/slow-travel-in-portugal">Read the latest</a><a class="btn ghost" href="/newsletter">Get it by email</a></div></div>

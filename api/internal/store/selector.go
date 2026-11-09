@@ -338,7 +338,7 @@ func isHex(c byte) bool { return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' ||
 
 // Click is what the server knows about a recorded click: the tracker's CSS
 // path (at most five levels, two classes per ancestor, stopping at the first
-// ancestor with an id or at <body>), the target's id and first three classes,
+// ancestor with an id or at <body>), the target's id and first six classes,
 // and the value of the closest data-calor-component attribute.
 type Click struct {
 	PageURL   string

@@ -57,10 +57,38 @@ const CFG = {
   },
 };
 
+// Demo component tags: CSS selectors (the primary mechanism) plus
+// data-calor-component values present in the demo markup. post-subscribe and
+// cart-summary are left unregistered so they show up as discovered values.
+const COMPONENTS = {
+  'acme-coffee': [
+    { name: 'Hero CTAs', selector: '.hero .ctas', pagePattern: '/' },
+    { name: 'Add to cart buttons', selector: 'button.add-to-cart' },
+    { name: 'Main navigation', selector: 'header.top nav.main' },
+    { name: 'Product cards', attrValue: 'product-card' },
+    { name: 'Newsletter signup', attrValue: 'newsletter-signup', pagePattern: '/' },
+    { name: 'Product options', selector: '.chips', pagePattern: '/products/*' },
+  ],
+  'nimbus-analytics': [
+    { name: 'Hero CTAs', selector: '.hero .ctas', pagePattern: '/' },
+    { name: 'Pricing cards', attrValue: 'pricing-card', pagePattern: '/pricing' },
+    { name: 'Pricing FAQ', selector: 'details', pagePattern: '/pricing' },
+    { name: 'App tabs', selector: '.tabs', pagePattern: '/app*' },
+    { name: 'Header CTAs', selector: 'header.top .btn' },
+  ],
+  'fieldnote-journal': [
+    { name: 'Share bar', attrValue: 'share-bar', pagePattern: '/posts/*' },
+    { name: 'Story cards', selector: '.grid .card', pagePattern: '/' },
+    { name: 'Header subscribe', selector: 'header.top .btn.primary' },
+  ],
+};
+
 const DEVICE_VIEW = { desktop: [1440, 900, 1], mobile: [390, 844, 2.4], tablet: [820, 1180, 1.35] };
 
-async function measure(browser, site, path) {
+async function measure(browser, site, path, withComponents) {
   const page = await browser.newPage();
+  // Component ids change on every re-seed; never reuse a cached tracker config.
+  await page.setCacheEnabled(false);
   // Request interception never sees sendBeacon (ping) requests, so silence the tracker in-page.
   await page.evaluateOnNewDocument(() => {
     navigator.sendBeacon = () => true;
@@ -70,6 +98,8 @@ async function measure(browser, site, path) {
   const url = `http://${site.host}:${DEMO_PORT}${path}`;
   await page.goto(url, { waitUntil: 'networkidle0' });
   await page.waitForFunction(() => window.calor && window.calor.describe);
+  // The tracker fetches the site's component rules once per session.
+  if (withComponents) await page.waitForFunction(() => sessionStorage.getItem('calor_cfg'));
   const data = await page.evaluate(() => {
     const INTERACTIVE = 'a[href],button,input,select,textarea,summary,[role=tab]';
     const sel = `${INTERACTIVE},h1,h2,h3,.thumb,.logos span,.kpi,.cover,.quote,.price,article p`;
@@ -81,7 +111,9 @@ async function measure(browser, site, path) {
       if (!interactive && el.closest(INTERACTIVE)) continue;
       const desc = window.calor.describe(el);
       const a = el.closest('a[href]');
+      const cmp = window.calor.match(el);
       out.push({
+        cmp: cmp.length ? cmp : undefined,
         interactive,
         header: !!el.closest('header.top'),
         route: !!el.closest('[data-route]'),
@@ -146,7 +178,7 @@ function simulateSession(site, cfg, layouts, start) {
       const label = el.desc.aria || el.desc.txt || '';
       const burst = cfg.rage && cfg.rage[0].test(label) && R.chance(cfg.rage[1]) ? 3 + R.int(3) : 1;
       for (let b = 0; b < burst; b++) {
-        events.push({ t: 'c', ts: t + b * 180, u: url, p: pv, x: x + R.int(9) - 4, y: y + R.int(9) - 4, dw, dh, vw, vh, el: el.desc, rage: b >= 2 ? 1 : undefined, dead: el.interactive ? undefined : 1 });
+        events.push({ t: 'c', ts: t + b * 180, u: url, p: pv, x: x + R.int(9) - 4, y: y + R.int(9) - 4, dw, dh, vw, vh, el: el.desc, cmp: el.cmp, rage: b >= 2 ? 1 : undefined, dead: el.interactive ? undefined : 1 });
       }
       clicks++;
       t += burst * 180;
@@ -171,7 +203,7 @@ function simulateSession(site, cfg, layouts, start) {
         const el = nav[R.int(nav.length)];
         const [x, y] = pos(el.box);
         const toPath = new URL(el.href).pathname.replace(/\/$/, '') || '/';
-        events.push({ t: 'c', ts: t, u: url, p: pv, x, y, dw, dh, vw, vh, el: el.desc });
+        events.push({ t: 'c', ts: t, u: url, p: pv, x, y, dw, dh, vw, vh, el: el.desc, cmp: el.cmp });
         events.push({ t: 'n', ts: t + 5, u: url, p: pv, k: el.route ? 'pushstate' : 'link', to: origin + toPath, x, y, dw, dh, vw, vh });
         next = { path: toPath, kind: el.route ? 'pushstate' : 'load' };
       }
@@ -221,9 +253,14 @@ async function main() {
     await api('DELETE', `/api/sites/${site.id}`);
     const reg = await api('POST', '/api/sites', { id: site.id, name: site.name, domain: site.host });
     if (reg.status !== 201) throw new Error(`register ${site.id}: ${reg.status} ${reg.text}`);
+    const comps = COMPONENTS[site.id] || [];
+    for (const c of comps) {
+      const res = await api('POST', `/api/sites/${site.id}/components`, c);
+      if (res.status !== 201) throw new Error(`component ${site.id}/${c.name}: ${res.status} ${res.text}`);
+    }
     const layouts = {};
     for (const path of Object.keys(cfg.pages)) {
-      const L = await measure(browser, site, path);
+      const L = await measure(browser, site, path, comps.length > 0);
       layouts[path] = L;
       const up = await api('PUT', `/api/sites/${site.id}/screenshot?url=${encodeURIComponent(L.url)}`, new Uint8Array(L.shot), { 'Content-Type': 'image/jpeg' });
       if (up.status !== 200) throw new Error(`screenshot ${L.url}: ${up.status} ${up.text}`);
@@ -272,6 +309,10 @@ async function main() {
   }
   await Promise.all(Array.from({ length: 8 }, worker));
   await new Promise((r) => setTimeout(r, 1500));
+  for (const site of demoSites) {
+    const res = await api('GET', `/api/sites/${site.id}/components`);
+    for (const c of res.json.components) console.log(`  ${site.id} component "${c.name}": ${c.clicks} clicks, ${c.visitors} visitors`);
+  }
   console.log(`seeded ${totalSessions} sessions / ${sent} events (${rejected} rejected) across ${demoSites.length} sites in ${((Date.now() - started) / 1000).toFixed(1)}s`);
 }
 
