@@ -25,7 +25,13 @@
   components.
   - The admin's browser never sees the key.
   - Client-side code reaches the API only through `dashboard/app/api/calor/[...path]`,
-    an allow-listed proxy: heatmap, elements, screenshots, screenshot upload.
+    an allow-listed proxy: heatmap, elements, screenshots, screenshot upload, and the
+    component match preview.
+  - The element picker loads the tracked page through `dashboard/app/api/calor-frame`.
+    It fetches only pages on the site's own domain, strips scripts and inline handlers,
+    adds a `<base>` tag, sends `Content-Security-Policy: script-src 'none'`, and caps the
+    size at 3 MiB. The result is shown in a sandboxed same-origin iframe, so the picker
+    can read its DOM without running the site's code.
 - The **API** is the only process that touches SQLite.
 
 ## API internals (`api/internal`)
@@ -47,6 +53,7 @@
     grid of document-relative cells. A heatmap reads a few thousand cells instead of
     every click.
   - `screenshots`: one image per site and page.
+  - `components` and `event_components` (component tagging, below).
 - **Aggregations** are plain SQL: window functions for entry/exit and bounce, per
   pageview max scroll depth, and gap-filled daily series. Labels and element grouping
   are assembled in Go.
@@ -110,46 +117,73 @@
 - **Filters** live in the URL: range, from/to and device. The browser timezone offset is
   stored in a cookie, so days and hours are local.
 
-## Component tagging (in progress)
+## Component tagging
 
 Goal: name parts of a page ("Hero CTAs", "Pricing cards", "Newsletter form") and get
-heatmaps and stats scoped to clicks inside them.
+heatmaps and stats scoped to clicks inside them, including clicks recorded before the
+component existed.
 
 **Defining a component:**
 
-- A component is defined per site by a CSS selector (primary) and/or an HTML data
-  attribute such as `data-calor-component="newsletter"`.
-- It can optionally be scoped to pages by a path pattern with `*` wildcards
-  (`/products/*`).
+- A component is defined per site by a CSS selector (primary), an HTML data attribute
+  such as `data-calor-component="newsletter"`, or both. A click matches when any rule
+  matches.
+- It can be limited to pages by a path pattern with `*` wildcards (`/products/*`).
 
-**Storage:**
+**Storage** (schema version 2, applied as one transaction; adding a column with a constant
+default is instant even on large databases):
 
 - `components(id, site_id, name, selector, attr_name, attr_value, page_pattern,
-  created_at, updated_at)`.
-- `event_components(component_id, ts, event_id)`, a `WITHOUT ROWID` junction keyed for
-  range scans per component.
-- A new `events.el_component` column holds the value of the closest
-  `data-calor-component` ancestor.
+  created_at, updated_at)`, with a foreign key to `sites` (`ON DELETE CASCADE`).
+- `event_components(component_id, ts, event_id)`, a `WITHOUT ROWID` junction whose
+  primary key starts with the component and time, so a component-scoped query is a range
+  scan. It has no foreign keys; component and site deletes remove its rows in bounded
+  chunks.
+- `events.el_component` holds the closest `data-calor-component` value of each click.
 
 **Matching runs in three places, and the results are unioned:**
 
-1. **Tracker side** (most precise, full DOM). The tracker fetches a small cached config
-   from `GET /api/sites/{site}/tracker-config`, a few hundred bytes cached in
-   `sessionStorage`. It can also be embedded in the snippet. On click it runs
-   `target.closest(selector)` for each configured component that applies to the current
-   path, and sends the matching IDs as `cmp`. It always records the closest
-   `data-calor-component` value as `el.ca`, so attribute tagging needs no configuration.
-2. **Server side at ingest.** Each click's recorded ancestry (`el.sel`, plus the target's
-   id and classes) is matched against the site's selectors using a small CSS-subset
-   matcher: tag, `#id`, `.class`, `[attr]`, `[attr=value]`, `:nth-of-type()`, and the
-   descendant and child combinators. Attribute components match `el_component`. This
-   tags clicks from clients whose config hasn't loaded yet.
-3. **Retroactively,** when a component is created or its rules change. The server groups
-   past clicks by distinct (selector, page, attribute value), matches each group once,
-   and inserts junction rows in bounded transactions. The same grouped scan powers the
-   live match preview. Memory scales with the number of distinct groups, not clicks,
-   which keeps it inside the low-resource budget.
+1. **In the browser** (most precise: the full live DOM). The tracker fetches
+   `GET /api/sites/{site}/tracker-config` once per session and caches it in
+   `sessionStorage` for 5 minutes. The rules can also be embedded in the snippet
+   (`data-components`). On click it runs `target.closest(selector)` for each rule whose
+   page pattern matches the current path, and sends the matching IDs as `cmp`. It always
+   sends the closest `data-calor-component` value as `el.ca`. The ingest handler keeps at
+   most 20 IDs per click and drops any that aren't the site's components.
+2. **On the server at ingest.** Each click's recorded path (`el.sel`, plus the element's
+   id and classes) is matched against the site's compiled rules by a small CSS-subset
+   matcher, evaluated right to left like a browser. An attribute rule for
+   `data-calor-component` matches `el_component`. This tags clicks sent before the config
+   reached the browser. The compiled rules are cached in memory per site and rebuilt when
+   a component changes.
+3. **Retroactively,** when a component is created or a rule changes. Pending ingest is
+   flushed first. The server pages through the site's past clicks by id in batches of
+   5,000. It matches each distinct (path, element, attribute value, page) combination
+   once, using a memo capped at 100,000 entries, and inserts junction rows one batch per
+   transaction. The match preview runs the same matcher over clicks grouped in SQL by
+   element, so it writes nothing and costs one pass over the range.
 
-The server matcher only sees what the tracker recorded: up to 5 ancestor levels, with at
-most 2 classes per ancestor. So retroactive and preview counts can be lower than what
-the tracker tags on live traffic. They are not expected to be higher.
+Memory use stays flat: every pass streams fixed-size batches, and the memo is capped. On
+the seeded demo data (155k events), creating a component on the largest demo site,
+including the retroactive pass, takes about 270 ms. A preview takes 20–150 ms.
+
+**Queries.** `store.Filter.Component` adds
+`(type <> 'click' OR id IN (SELECT event_id FROM event_components WHERE component_id = ? AND ts …))`
+to every aggregation. Click metrics are scoped; pageviews, scroll and navigation stay
+page-wide. Component-scoped heatmaps bypass the hourly rollup, which has no component
+dimension, and count clicks only. The response cache needs no special handling, because
+component changes bump the site's cache generation.
+
+**Why this design.** Matching distinct element structures (hashing each click's path into
+an `elements` table) was the alternative. It needs a new wire format and an extra table
+before it pays off. The per-click junction reuses the path the tracker already records,
+gives exact per-click attribution for browser-side matches, which see the whole DOM, and
+keeps queries as an indexed range scan.
+
+**Limits:**
+
+- The server only sees what the tracker recorded: the element plus up to 4 ancestors,
+  6 classes on the element and 2 on each ancestor. Retroactive and preview counts can be
+  lower than what the tracker tags on live traffic. They are not expected to be higher.
+- Attribute tests other than a lone `[data-calor-component=…]` are browser-only, so they
+  tag new traffic only (`evaluable: false`).

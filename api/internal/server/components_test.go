@@ -54,6 +54,23 @@ func TestComponentCRUDAndValidation(t *testing.T) {
 	}
 	sel := h.createComponent("acme", `{"name":"Hero CTAs","selector":".hero .ctas","pagePattern":"/"}`).Component
 
+	for body, want := range map[string]string{
+		`{"name":"hero ctas","selector":"main a"}`:   `named \"Hero CTAs\"`,
+		`{"name":"Signup","attrValue":"newsletter"}`: `already used by \"Newsletter\"`,
+	} {
+		rec := h.admin("POST", "/api/sites/acme/components", strings.NewReader(body))
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), want) || !strings.Contains(rec.Body.String(), "conflictsWith") {
+			t.Errorf("%s: %d %s (want 409 mentioning %s)", body, rec.Code, rec.Body, want)
+		}
+	}
+	if rec := h.admin("PATCH", "/api/sites/acme/components/"+sel.ID, strings.NewReader(`{"name":"NEWSLETTER"}`)); rec.Code != http.StatusConflict {
+		t.Errorf("rename onto an existing name: %d", rec.Code)
+	}
+	if rec := h.admin("PATCH", "/api/sites/nimbus/components/"+sel.ID, strings.NewReader(`{"name":"x"}`)); rec.Code != http.StatusNotFound {
+		t.Errorf("cross-site patch: %d", rec.Code)
+	}
+	h.createComponent("nimbus", `{"name":"Newsletter","attrValue":"newsletter"}`)
+
 	rec := h.admin("PATCH", "/api/sites/acme/components/"+sel.ID, strings.NewReader(`{"name":"Hero buttons"}`))
 	up := decode[componentResp](t, rec)
 	if rec.Code != 200 || up.Component.Name != "Hero buttons" || up.Retagged || up.Component.Selector != ".hero .ctas" {

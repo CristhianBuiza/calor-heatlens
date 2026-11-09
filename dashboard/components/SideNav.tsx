@@ -14,12 +14,16 @@ export default function SideNav({ fallbackSite, siteIds }: { fallbackSite: strin
     if (v) keep.set(k, v);
   }
   const q = keep.size ? `?${keep}` : '';
+  const scoped = new URLSearchParams(keep);
+  if (sp.get('component')) scoped.set('component', sp.get('component')!);
+  const qc = scoped.size ? `?${scoped}` : '';
   const base = `/s/${encodeURIComponent(site)}`;
   const cmpQ = new URLSearchParams(keep);
   cmpQ.set('sites', siteIds.slice(0, 3).join(','));
   const items = [
-    { href: `${base}${q}`, label: 'Overview', icon: '◎', active: pathname === base },
-    { href: `${base}/pages${q}`, label: 'Pages', icon: '☰', active: pathname.startsWith(`${base}/pages`) || pathname.startsWith(`${base}/detail`) },
+    { href: `${base}${qc}`, label: 'Overview', icon: '◎', active: pathname === base },
+    { href: `${base}/pages${qc}`, label: 'Pages', icon: '☰', active: pathname.startsWith(`${base}/pages`) || pathname.startsWith(`${base}/detail`) },
+    { href: `${base}/components${q}`, label: 'Components', icon: '◇', active: pathname.startsWith(`${base}/components`) },
     { href: `/compare?${cmpQ}`, label: 'Compare sites', icon: '⇄', active: pathname.startsWith('/compare') },
     { href: '/sites', label: 'Sites & snippet', icon: '⚙', active: pathname.startsWith('/sites') },
   ];

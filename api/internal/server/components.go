@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -270,6 +271,33 @@ func (s *Server) componentsChanged(ctx context.Context, siteID string) {
 	s.sites.invalidate(ctx, siteID)
 }
 
+// checkComponentConflict writes a 409 when another component of the site
+// already has c's name or attribute value; names compare case-insensitively.
+func (s *Server) checkComponentConflict(w http.ResponseWriter, r *http.Request, c store.Component) bool {
+	sc, err := s.comps.get(r.Context(), c.SiteID)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	for _, o := range sc.list {
+		if o.ID == c.ID {
+			continue
+		}
+		msg := ""
+		switch {
+		case strings.EqualFold(o.Name, c.Name):
+			msg = "a component named " + strconv.Quote(o.Name) + " already exists"
+		case c.AttrValue != "" && o.AttrName == c.AttrName && o.AttrValue == c.AttrValue:
+			msg = c.AttrName + "=" + strconv.Quote(c.AttrValue) + " is already used by " + strconv.Quote(o.Name)
+		default:
+			continue
+		}
+		writeJSON(w, r, http.StatusConflict, map[string]any{"error": msg, "conflictsWith": o.ID})
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleCreateComponent(w http.ResponseWriter, r *http.Request) {
 	site := siteFrom(r)
 	var in componentInput
@@ -289,6 +317,9 @@ func (s *Server) handleCreateComponent(w http.ResponseWriter, r *http.Request) {
 	}
 	if n >= maxComponentsPerSite {
 		writeError(w, r, http.StatusConflict, "component limit reached for this site")
+		return
+	}
+	if !s.checkComponentConflict(w, r, c) {
 		return
 	}
 	c, err = s.store.CreateComponent(r.Context(), c)
@@ -325,6 +356,9 @@ func (s *Server) handleUpdateComponent(w http.ResponseWriter, r *http.Request) {
 	c := old
 	if err := in.apply(&c); err != nil {
 		writeError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !s.checkComponentConflict(w, r, c) {
 		return
 	}
 	c, err = s.store.UpdateComponent(r.Context(), c)

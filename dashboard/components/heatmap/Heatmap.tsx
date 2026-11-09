@@ -104,7 +104,8 @@ export default function Heatmap({ site, url, query, screenshot, pins }: HeatmapP
   }, [mode, shot, data]);
   const rows = Math.max(4, Math.min(800, Math.round(COLS * aspect)));
 
-  const qs = useMemo(() => new URLSearchParams({ ...query, url, type, cols: String(COLS), rows: String(rows) }).toString(), [query, url, type, rows]);
+  const shownType = query.component ? 'click' : type;
+  const qs = useMemo(() => new URLSearchParams({ ...query, url, type: shownType, cols: String(COLS), rows: String(rows) }).toString(), [query, url, shownType, rows]);
 
   useEffect(() => {
     const ctl = new AbortController();
@@ -155,7 +156,7 @@ export default function Heatmap({ site, url, query, screenshot, pins }: HeatmapP
     <div className="heatmap">
       <div className="hm-toolbar">
         <div className="seg" role="group" aria-label="Event type">
-          {(['click', 'navigation', 'all'] as const).map((t) => (
+          {(query.component ? (['click'] as const) : (['click', 'navigation', 'all'] as const)).map((t) => (
             <button key={t} className={type === t ? 'on' : ''} onClick={() => setType(t)}>
               {t === 'click' ? 'Clicks' : t === 'navigation' ? 'Link exits' : 'All'}
             </button>

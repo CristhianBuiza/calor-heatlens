@@ -94,3 +94,49 @@ export type CompareSite = {
   devices: DeviceStat[];
   topPages: PageRow[];
 };
+
+export type Component = {
+  id: string;
+  siteId: string;
+  name: string;
+  selector: string;
+  attrName: string;
+  attrValue: string;
+  pagePattern: string;
+  createdAt: number;
+  updatedAt: number;
+  browserSelector: string;
+  evaluable: boolean;
+  clicks: number;
+  visitors: number;
+  lastSeen: number;
+};
+
+export type ComponentList = { components: Component[]; limit: number };
+
+export type ComponentStats = {
+  clicks: number;
+  visitors: number;
+  rageClicks: number;
+  deadClicks: number;
+  siteClicks: number;
+  clickShare: number;
+  exposedPageviews: number;
+  clickedPageviews: number;
+  clickRate: number;
+  firstSeen: number;
+  lastSeen: number;
+  pages: PageCount[];
+  exposureSource: 'pattern' | 'clicked-pages';
+};
+
+export type MatchPreview = {
+  matchedClicks: number;
+  totalClicks: number;
+  share: number;
+  pages: PageCount[];
+  elements: { pageUrl: string; selector: string; label: string; clicks: number }[];
+  evaluable: boolean;
+};
+
+export type DiscoveredAttrs = { attribute: string; values: { value: string; clicks: number; pages: number; componentId?: string }[] };

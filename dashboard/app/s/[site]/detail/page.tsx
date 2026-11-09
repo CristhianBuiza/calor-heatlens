@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { DevicesSection, ElementsSection, FlowSection, HeatmapSection, KpiSection, ScrollSection, TimeOfDaySection, TrendSection } from '@/components/sections';
+import { ComponentScope, ScopeBanner } from '@/components/ComponentScope';
 import { Card, Lazy } from '@/components/ui';
 import { filterQuery, one, readFilters } from '@/lib/filters';
 import { pathOf } from '@/lib/format';
@@ -29,11 +30,13 @@ export default async function PageDetail(props: PageProps<'/s/[site]/detail'>) {
             {f.device ? ` · ${f.device}` : ''}
           </p>
         </div>
+        <ComponentScope site={site.id} f={f} />
       </div>
+      <ScopeBanner site={site.id} f={f} path={`/s/${site.id}/detail`} keep={{ url }} />
       <Lazy height={190}>
         <KpiSection {...p} />
       </Lazy>
-      <Card id="heatmap" title="Click heatmap" subtitle="Clicks binned relative to document size, drawn over a full-page screenshot. Numbered pins mark the top elements.">
+      <Card id="heatmap" title={f.component ? 'Component click heatmap' : 'Click heatmap'} subtitle={`Clicks${f.component ? ' inside the selected component' : ''} binned relative to document size, drawn over a full-page screenshot. Numbered pins mark the top elements.`}>
         <Lazy height={560}>
           <HeatmapSection {...p} />
         </Lazy>

@@ -9,6 +9,7 @@ export type Filters = {
   device: string;
   tz: number; // minutes east of UTC
   partial: boolean; // range ends today, so the last day is incomplete
+  component: string; // component id scoping click metrics, or ""
 };
 
 export const RANGES = ['7d', '14d', '30d', '90d'] as const;
@@ -39,16 +40,17 @@ export async function readFilters(sp: SearchParams): Promise<Filters> {
     to = ymd(now, tz);
     from = ymd(now - (days - 1) * 86_400_000, tz);
   }
-  return { range, from, to, device, tz, partial: to === ymd(Date.now(), tz) };
+  const component = /^cmp_[a-z0-9]{1,40}$/.test(one(sp.component)) ? one(sp.component) : '';
+  return { range, from, to, device, tz, partial: to === ymd(Date.now(), tz), component };
 }
 
 /** Query parameters understood by the Go API. Dates align to local midnight,
  * so the API can answer heatmaps from its hourly rollup table. */
 export function apiParams(f: Filters, extra: Record<string, string | number | undefined> = {}) {
-  return { from: f.from, to: f.to, tz: f.tz, device: f.device || undefined, ...extra };
+  return { from: f.from, to: f.to, tz: f.tz, device: f.device || undefined, component: f.component || undefined, ...extra };
 }
 
-/** Preserve the current filter in links. */
+/** Preserve the current filter in links; an extra value of '' drops that key. */
 export function filterQuery(f: Filters, extra: Record<string, string | undefined> = {}) {
   const q = new URLSearchParams();
   if (f.range === 'custom') {
@@ -56,7 +58,11 @@ export function filterQuery(f: Filters, extra: Record<string, string | undefined
     q.set('to', f.to);
   } else if (f.range !== '30d') q.set('range', f.range);
   if (f.device) q.set('device', f.device);
-  for (const [k, v] of Object.entries(extra)) if (v) q.set(k, v);
+  if (f.component) q.set('component', f.component);
+  for (const [k, v] of Object.entries(extra)) {
+    if (v) q.set(k, v);
+    else if (v === '') q.delete(k);
+  }
   const s = q.toString();
   return s ? `?${s}` : '';
 }

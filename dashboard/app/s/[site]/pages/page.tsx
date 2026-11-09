@@ -1,4 +1,5 @@
 import { PagesTableSection } from '@/components/sections';
+import { ComponentScope, ScopeBanner } from '@/components/ComponentScope';
 import { Card, Lazy } from '@/components/ui';
 import { one, readFilters } from '@/lib/filters';
 import { getSite } from '@/lib/site';
@@ -19,10 +20,12 @@ export default async function Pages(props: PageProps<'/s/[site]/pages'>) {
           <p className="muted">Clicks, unique visitors, scroll depth, entries and exits for every tracked page. Sorted and paginated by the API.</p>
         </div>
         <form className="search" action={path}>
-          {['range', 'from', 'to', 'device'].map((k) => (one(sp[k]) ? <input key={k} type="hidden" name={k} value={one(sp[k])} /> : null))}
+          {['range', 'from', 'to', 'device', 'component'].map((k) => (one(sp[k]) ? <input key={k} type="hidden" name={k} value={one(sp[k])} /> : null))}
           <input name="q" defaultValue={q} placeholder="Filter by path…" aria-label="Filter pages" />
         </form>
+        <ComponentScope site={site.id} f={f} />
       </div>
+      <ScopeBanner site={site.id} f={f} path={path} />
       <Card>
         <Lazy height={600}>
           <PagesTableSection site={site.id} f={f} sort={one(sp.sort) || 'clicks'} order={one(sp.order) || 'desc'} offset={+one(sp.offset) || 0} limit={25} q={q} path={path} />

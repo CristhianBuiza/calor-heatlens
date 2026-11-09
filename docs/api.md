@@ -7,7 +7,7 @@ noted. Responses of 1 KB or more are gzipped when the client sends
 ## Authentication
 
 - **Public, no key:** `POST /api/events`, `OPTIONS /api/events`, `GET /healthz`,
-  `GET /tracker/*`, and (component tagging, in progress) `GET /api/sites/{site}/tracker-config`.
+  `GET /tracker/*`, and `GET /api/sites/{site}/tracker-config`.
 - **Everything else** needs the admin key (`CALOR_ADMIN_KEY`), sent as
   `Authorization: Bearer <key>` or `X-API-Key: <key>`. The key is compared in constant
   time.
@@ -53,7 +53,8 @@ or `application/json`. The body is one batch:
 | `d` | ms offset from the envelope `ts`. The server re-anchors to its own clock, which fixes client clock skew |
 | `u`, `p`, `vw`, `vh` | only present when they differ from the envelope |
 | `x`, `y`, `dw`, `dh` | click position relative to the document, and document size (clicks; also link navigations) |
-| `el` | clicked element: `sel` (CSS path, at most 5 levels), `tag`, `id`, `cls` (up to 3 classes), `txt` (≤ 80 chars), `aria` (aria-label/title/alt) |
+| `el` | clicked element: `sel` (CSS path, at most 5 levels, up to 2 classes per ancestor), `tag`, `id`, `cls` (up to 6 classes), `txt` (≤ 80 chars), `aria` (aria-label/title/alt), `ca` (closest `data-calor-component` value, ≤ 60 chars) |
+| `cmp` | IDs of the site's components that contain the click, matched in the browser (clicks). The server keeps at most 20, and only IDs of the site's own components |
 | `rage`, `dead` | click flags |
 | `k` | kind. Navigation: `link`, `pushstate`, `replacestate`, `popstate`, `unload`. Pageview: `load` or the SPA kinds |
 | `to` | navigation target URL |
@@ -97,6 +98,7 @@ All analytics routes are scoped by site: `/api/sites/{site}/…`.
 | `tz` | minutes east of UTC |
 | `device` | `mobile` (< 768 px), `tablet` (< 1024 px) or `desktop` |
 | `url` | restrict to one page (normalized to scheme://host/path) |
+| `component` | restrict click-based metrics to clicks inside this component (see below). Pageviews, scroll and navigation data stay unscoped. Unknown IDs return 404 |
 
 **Endpoints:**
 
@@ -112,7 +114,7 @@ All analytics routes are scoped by site: `/api/sites/{site}/…`.
 | `entry-exit?limit=` | top entry pages, exit pages, and exit points (last click of the final pageview) |
 | `referrers` | external referrer hosts (internal ones excluded) |
 | `flow?url=` | for one page: where visitors came from and where they went next |
-| `heatmap?url=&type=click\|navigation\|all&cols=&rows=` | binned grid `{cols, rows, cells:[{x,y,n}], …meta}`. Served from the hourly rollup when the range is hour-aligned; raw events otherwise |
+| `heatmap?url=&type=click\|navigation\|all&cols=&rows=` | binned grid `{cols, rows, cells:[{x,y,n}], …meta}`. Served from the hourly rollup when the range is hour-aligned and no `component` is set; raw events otherwise (`source` says which). With `component`, only clicks are counted |
 | `screenshot?url=` (GET, PUT or POST, DELETE) | page screenshot: png/jpeg/webp/gif, ≤ 8 MiB, raw body or multipart. GET supports ETag |
 | `screenshot/meta?url=` | screenshot width, height and updatedAt |
 
@@ -126,20 +128,58 @@ Responses are cached for `CALOR_CACHE_TTL_SEC` (default 15 s, at most 256 entrie
 MB). The cache is invalidated per site on ingest, so a response carries `X-Cache: hit`
 or `miss`.
 
-## Component tagging (in progress)
+## Component tagging
 
-See the README section "Component tagging" for the model. Planned and partially
-implemented endpoints:
+A component has a `name` and one or both rules: a CSS `selector`, and an attribute
+(`attrName`, default `data-calor-component`, plus `attrValue`). `pagePattern` optionally
+limits it to paths (`/`, `/products/*`; `*` matches anything, the query string is
+ignored). See the README section "Component tagging" for the model and limits.
 
 | Method & path | |
 |---|---|
-| `GET /api/sites/{site}/components` | list with click stats for the range |
-| `POST /api/sites/{site}/components` | `{"name", "selector"?, "attrName"?, "attrValue"?, "pagePattern"?}`. Validates the selector, then tags past clicks |
-| `GET/PATCH/DELETE /api/sites/{site}/components/{id}` | read, update (re-tags history when the matching rules change), delete |
-| `POST /api/sites/{site}/components/preview` | match preview for an unsaved definition: matching clicks, visitors, pages, sample elements |
-| `GET /api/sites/{site}/components/{id}/stats` | per-component KPIs, top pages, elements |
-| `GET /api/sites/{site}/tracker-config` | public. The compact list of selectors the tracker evaluates on click (cacheable) |
-| `component=<id>` parameter | scopes `heatmap`, `elements`, `time-of-day`, `daily` and `devices` to clicks inside the component |
+| `GET /api/sites/{site}/components?from&to&tz&device` | `{"components":[Component], "limit":200}` with `clicks`, `visitors` and `lastSeen` for the range |
+| `POST /api/sites/{site}/components` | `{"name", "selector"?, "attrName"?, "attrValue"?, "pagePattern"?}` → `201 {"component", "tagged"}`. Past clicks are tagged before it returns; `tagged` is how many |
+| `GET /api/sites/{site}/components/{id}` | Component with range stats |
+| `PATCH /api/sites/{site}/components/{id}` | any subset of the create fields → `{"component", "retagged", "tagged"?}`. Past clicks are re-tagged only when a rule changes |
+| `DELETE /api/sites/{site}/components/{id}` | → 204. Its tags are removed in bounded transactions |
+| `GET /api/sites/{site}/components/{id}/stats?from&to&tz&device` | `{"component", "stats"}`: clicks, visitors, rage/dead clicks, `clickShare` (% of all clicks), `exposedPageviews`, `clickedPageviews`, `clickRate`, first/last seen, top pages |
+| `POST /api/sites/{site}/components/preview?from&to&tz&device` | body like create (`name` optional) → `{"preview":{matchedClicks, totalClicks, share, pages, elements, evaluable}, "browserSelector", "attrName"}`. Nothing is written |
+| `GET /api/sites/{site}/components/discovered?from&to` | `{"attribute":"data-calor-component", "values":[{value, clicks, pages, componentId?}]}`: values seen on clicks, with the component that claims each |
+| `GET /api/sites/{site}/tracker-config` | public, CORS `*`, `Cache-Control: max-age=300`. `{"c":[[id, browserSelector, pagePattern], …]}` |
+
+The trend, elements, time-of-day and heatmap views of a component use the regular
+analytics routes with `component=<id>`.
+
+**Component object:**
+
+```json
+{"id":"cmp_cated4z2hwf3q","siteId":"acme-coffee","name":"Add to cart buttons",
+ "selector":"button.add-to-cart","attrName":"","attrValue":"","pagePattern":"",
+ "createdAt":1794225160824,"updatedAt":1794225160824,
+ "browserSelector":"button.add-to-cart","evaluable":true,
+ "clicks":2294,"visitors":1393,"lastSeen":1794225757685}
+```
+
+- `browserSelector` is what the tracker runs: the selector, the attribute rule as
+  `[name="value"]`, or both joined with a comma.
+- `evaluable` is false when the server can't check the rule against recorded clicks
+  (attribute tests the tracker doesn't record). Such components are tagged only in the
+  browser, from new traffic.
+
+**Validation** (400 with `{"error"}`):
+
+- A name (≤ 80 chars) and at least one rule are required.
+- Selectors: at most 300 characters, 10 comma alternatives and 8 compounds each. Supported:
+  tag, `*`, `#id`, `.class`, `[attr]`, `[attr=value]` (quoted or not), `:nth-of-type(n)`,
+  descendant and `>` combinators. Sibling combinators, other pseudo-classes and
+  pseudo-elements are rejected with a message that says why.
+- `attrName` must be a lowercase attribute name. `data-calor-component` values are at
+  most 60 characters (the tracker records 60), other values at most 100.
+- `pagePattern` must start with `/`.
+
+**Conflicts** (409 with `{"error", "conflictsWith"?}`): a name already used in the site
+(case-insensitive), an attribute value already used by another component, or the limit of
+200 components per site.
 
 ## Tracker → API traffic (measured)
 

@@ -4,8 +4,8 @@
 // is captured byte-for-byte on the wire, including the ones sent while a page
 // unloads (DevTools drops most of those). Then verifies the events reached
 // the API and measures typical dashboard query response sizes.
-// Run it before `seed.mjs`: seeding re-registers the sites and wipes these
-// test events.
+// Seeding re-registers the sites and wipes these test events; when the sites
+// have components (after `make seed`) the run also checks component tagging.
 //   node live.mjs  -> prints a summary, writes output/traffic.json
 import { mkdirSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
@@ -86,6 +86,11 @@ async function counts(site) {
   return { clicks: k.clicks, pageviews: k.pageviews, visitors: k.uniqueVisitors, rage: k.rageClicks, navigations: k.navigations };
 }
 
+async function componentClicks(site) {
+  const res = await api('GET', `/api/sites/${site}/components`);
+  return Object.fromEntries((res.json?.components || []).map((c) => [c.name, c.clicks]));
+}
+
 async function main() {
   await waitFor(`${API}/healthz`);
   const sites = ['acme-coffee', 'nimbus-analytics', 'fieldnote-journal'];
@@ -94,6 +99,7 @@ async function main() {
   process.on('exit', () => demo.kill());
   await waitFor(`http://127.0.0.1:${DEMO_PORT}/calor.min.js`);
   const before = Object.fromEntries(await Promise.all(sites.map(async (s) => [s, await counts(s)])));
+  const compBefore = Object.fromEntries(await Promise.all(sites.map(async (s) => [s, await componentClicks(s)])));
   const browser = await launch();
 
   // Acme: CTA -> shop, single dead click flushed by the 5 s timer, rage clicks, cart, exit.
@@ -162,6 +168,11 @@ async function main() {
   proxy.close();
 
   const after = Object.fromEntries(await Promise.all(sites.map(async (s) => [s, await counts(s)])));
+  const compDelta = {};
+  for (const s of sites) {
+    const now = await componentClicks(s);
+    compDelta[s] = Object.fromEntries(Object.keys(now).map((k) => [k, now[k] - (compBefore[s][k] || 0)]).filter(([, v]) => v));
+  }
   const delta = Object.fromEntries(sites.map((s) => [s, Object.fromEntries(Object.keys(after[s]).map((k) => [k, after[s][k] - before[s][k]]))]));
 
   const reqs = captured
@@ -229,7 +240,17 @@ async function main() {
     sizes[name] = { status: gz.status, rawBytes: plain.bytes, gzipBytes: gz.enc === 'gzip' ? gz.bytes : null, cache: gz.cache, ms: gz.ms };
   }
 
-  const report = { capturedRequests: reqs.length, delta, examples: { singleClick: single, typicalBatch: typical, linkNavigation: linkNav, exitBeacon: exit }, requests: reqs.map(({ body, ...r }) => r), apiResponseSizes: sizes };
+  // Component tagging on the wire: ids matched in the browser (cmp) and the
+  // closest data-calor-component value (el.ca).
+  const clicks = reqs.flatMap((r) => r.body.e.filter((e) => e.t === 'c'));
+  const tagging = {
+    clicks: clicks.length,
+    withComponentIds: clicks.filter((e) => e.cmp && e.cmp.length).length,
+    attributeValues: [...new Set(clicks.map((e) => e.el && e.el.ca).filter(Boolean))],
+    componentClicksAdded: compDelta,
+    example: clicks.find((e) => e.cmp && e.el && e.el.ca),
+  };
+  const report = { capturedRequests: reqs.length, delta, tagging, examples: { singleClick: single, typicalBatch: typical, linkNavigation: linkNav, exitBeacon: exit }, requests: reqs.map(({ body, ...r }) => r), apiResponseSizes: sizes };
   mkdirSync('output', { recursive: true });
   writeFileSync('output/traffic.json', JSON.stringify(report, null, 2));
 
@@ -237,7 +258,18 @@ async function main() {
   for (const r of reqs) console.log(`  ${r.transport.padEnd(15)} ${String(r.bodyBytes).padStart(5)} B body  ${String(r.requestHeaderBytes).padStart(4)} B hdr  -> ${r.status} ${r.responseBody} (${r.responseBodyBytes} B body, ${r.responseHeaderBytes} B hdr)  [${r.types.join(' ')}]`);
   console.log('events landed in the API (after - before):', JSON.stringify(delta));
   console.log('API response sizes:', JSON.stringify(sizes, null, 1));
-  const ok = sites.every((s) => delta[s].pageviews > 0) && delta['acme-coffee'].clicks > 0 && delta['acme-coffee'].rage > 0 && reqs.every((r) => r.status === 202);
+  console.log('component tagging:', JSON.stringify(tagging));
+  const hasComponents = Object.values(compBefore).some((m) => Object.keys(m).length);
+  const taggingOk =
+    !hasComponents ||
+    (tagging.withComponentIds > 0 &&
+      tagging.attributeValues.includes('product-card') &&
+      tagging.attributeValues.includes('share-bar') &&
+      compDelta['acme-coffee']['Hero CTAs'] >= 1 &&
+      compDelta['acme-coffee']['Add to cart buttons'] >= 4 &&
+      compDelta['fieldnote-journal']['Share bar'] >= 1);
+  if (!taggingOk) console.error('component tagging check failed');
+  const ok = taggingOk && sites.every((s) => delta[s].pageviews > 0) && delta['acme-coffee'].clicks > 0 && delta['acme-coffee'].rage > 0 && reqs.every((r) => r.status === 202);
   if (!ok) {
     console.error('E2E FAILED');
     process.exit(1);

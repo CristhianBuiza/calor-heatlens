@@ -17,7 +17,7 @@ E2E_ENV = CALOR_API=http://127.0.0.1:$(API_PORT) DASHBOARD=http://localhost:$(DA
 	DEMO_PORT=$(DEMO_PORT) CALOR_ADMIN_KEY=$(CALOR_ADMIN_KEY) CHROME_PATH=$(CHROME_PATH)
 
 .PHONY: help deps build build-api build-tracker build-dashboard test run-api run-demo run-dashboard dev start \
-	seed e2e screenshots loadtest measure clean
+	seed e2e e2e-tagging screenshots loadtest measure clean
 
 help: ## Show targets
 	@grep -E '^[a-z0-9-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
@@ -69,6 +69,9 @@ seed: ## Seed 3 demo sites with 30 days of traffic (needs API + demo running)
 
 e2e: ## Drive real browser sessions on the demo sites and capture tracker traffic
 	cd e2e && $(E2E_ENV) node live.mjs
+
+e2e-tagging: ## Component tagging in the dashboard: picker, preview, scoped heatmap (needs `make seed`)
+	cd e2e && $(E2E_ENV) SHOTS_DIR=$${SHOTS_DIR:-output} node tagging.mjs
 
 screenshots: ## Capture dashboard screenshots into e2e/output (or SHOTS_DIR)
 	cd e2e && $(E2E_ENV) SHOTS_DIR=$${SHOTS_DIR:-output} node screenshots.mjs

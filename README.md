@@ -1,10 +1,12 @@
 # Calor
 
 Calor is a self-hosted, privacy-friendly heatmap and click analytics tool for one or
-many websites. A 2.6 KB tracker records clicks, navigations and scroll depth. A single Go
+many websites. A 3 KB tracker records clicks, navigations and scroll depth. A single Go
 binary stores them in SQLite. A Next.js dashboard shows click heatmaps over page
 screenshots, most-clicked elements, time-of-day patterns, scroll reach, entry and exit
-pages, and side-by-side site comparisons.
+pages, and side-by-side site comparisons. Components (named page regions defined by a CSS
+selector or a `data-calor-component` attribute) scope heatmaps and click stats to one
+part of a page.
 
 It is built to run on a small VPS: in measured runs the whole stack stays under
 ~300 MiB of RAM.
@@ -24,7 +26,7 @@ It is built to run on a small VPS: in measured runs the whole stack stays under
 - [Embedding the tracker](#embedding-the-tracker)
 - [Dashboard features](#dashboard-features)
 - [Multi-site support](#multi-site-support)
-- [Component tagging (in progress)](#component-tagging-in-progress)
+- [Component tagging](#component-tagging)
 - [API summary](#api-summary)
 - [Resource usage (measured)](#resource-usage-measured)
 - [Deployment](#deployment)
@@ -55,7 +57,7 @@ It is built to run on a small VPS: in measured runs the whole stack stays under
 | `api/` | Go 1.22 module. `cmd/calor-api` is the server, `cmd/calor-loadtest` a load generator. `internal/store` holds the SQLite schema, migrations and aggregations; `internal/server` holds HTTP, ingest, auth and cache. Pure-Go SQLite ([modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)) is the only dependency |
 | `tracker/` | `src/calor.js`, the tracker, which has no dependencies. `build.mjs` (esbuild) produces `dist/calor.min.js`. `demo/` is a zero-dependency server for three demo sites |
 | `dashboard/` | Next.js 16 / React 19 App Router, `output: 'standalone'`. Runtime dependencies: `next`, `react`, `react-dom`, `server-only` |
-| `e2e/` | puppeteer-core scripts: realistic seed data, live browser test with wire-level traffic capture, resource measurement, screenshots |
+| `e2e/` | puppeteer-core scripts: realistic seed data (including demo components), live browser test with wire-level traffic capture, the component tagging UI test, resource measurement, screenshots |
 | `deploy/` | systemd units and Dockerfiles. `docker-compose.yml` is at the root |
 | `docs/` | architecture and API reference |
 
@@ -95,7 +97,8 @@ few seconds; analytics responses are cached for 15 s.
 |---|---|
 | `make dev` | the same three processes in development mode (`go run`, `next dev`) |
 | `make test` | `go vet` + Go tests |
-| `make e2e` | real Chrome sessions on the demo sites, capturing every tracker request. Writes `e2e/output/traffic.json`. Run it before `make seed`, which re-registers the demo sites |
+| `make e2e` | real Chrome sessions on the demo sites, capturing every tracker request. Writes `e2e/output/traffic.json`. When the sites have components (after `make seed`) it also checks that live clicks are tagged |
+| `make e2e-tagging` | drives the Components pages in Chrome: element picker, live match preview, create, the component filter on page detail, the per-component report, attribute registration and validation errors. Needs `make seed`; cleans up what it creates |
 | `make measure` | tracker size, dashboard JS per route, and API and dashboard RSS. Writes `e2e/output/measure.json` |
 | `make loadtest` | 30 s of ingest plus queries against a running API, with RSS sampling |
 | `make screenshots` | dashboard screenshots into `e2e/output/` (or `SHOTS_DIR`) |
@@ -169,7 +172,9 @@ paste the snippet it shows before `</body>`:
 | `data-max-batch` | `25` | flush as soon as this many events are queued |
 | `data-respect-dnt` | *(off)* | if present, do nothing when Do Not Track is on |
 
-- `window.CalorConfig = { siteId, endpoint, flushInterval, maxBatch, respectDnt }`
+| `data-components` | *(fetched)* | component rules as JSON (`[[id, selector, pagePattern], …]`) to skip the config request, or `off` to disable selector matching |
+
+- `window.CalorConfig = { siteId, endpoint, flushInterval, maxBatch, respectDnt, components }`
   works too.
 - Add `data-calor-ignore` to an element to exclude clicks inside it.
 - `window.calor.flush()` sends the queued events immediately.
@@ -177,13 +182,16 @@ paste the snippet it shows before `</body>`:
 **What is captured:**
 
 - **Clicks:** page-relative position, viewport and document size, and the element (CSS
-  path, tag, id, classes, trimmed text or aria-label). Rage clicks (3 within 1 s and
+  path, tag, id, classes, trimmed text or aria-label). Also the closest
+  `data-calor-component` value and the IDs of the site's components that contain the
+  click. Rage clicks (3 within 1 s and
   30 px) and dead clicks (outside any interactive element) are flagged.
 - **Navigations:** link clicks, SPA `pushState`/`replaceState`/`popstate`, and unloads.
 - **Pageviews:** referrer and redirect count.
 - **Per pageview:** max scroll depth and visible (engaged) time.
 
-The tracker is 5,246 B minified and **2,584 B gzipped**. See
+The tracker is 6,208 B minified and **3,011 B gzipped** (component tagging added 962 B /
+427 B gzip). See
 [`docs/api.md`](docs/api.md#tracker--api-traffic-measured) for the measured request
 sizes and when it sends.
 
@@ -216,6 +224,14 @@ sizes and when it sends.
     upload.
   - Page-level elements, scroll, devices, time of day, navigation flow (came from /
     went to), and trend.
+- **Components** (`/s/{site}/components`)
+  - Component list with clicks, visitors and last click for the range, plus attribute
+    values the tracker found in markup that aren't registered yet.
+  - Create and edit with an element picker over the page, manual CSS entry, or a data
+    attribute, and a live match preview. Delete asks for confirmation.
+  - A per-component report: KPIs, click rate, trend, pages, elements and time of day.
+  - A component filter on the overview, pages and page detail views that scopes the
+    heatmap and click metrics.
 - **Compare** (`/compare?sites=a,b,c`)
   - KPI table for 2–6 sites, with the best value per row highlighted.
   - Overlaid daily-visitors and hour-of-day charts.
@@ -239,49 +255,77 @@ sizes and when it sends.
 - **Dashboard:** a site switcher, per-site routes, site management with snippets, and
   cross-site comparison.
 
-## Component tagging (in progress)
+## Component tagging
 
-> **Status:** under active development and not finished in this revision. The design
-> below is what is being built. Parts may be missing or change before it is marked
-> complete.
+A component is a named part of your pages, such as "Hero CTAs", "Pricing cards" or
+"Newsletter form". Once defined, any heatmap or click metric can be filtered down to
+clicks inside it, and each component gets its own report.
 
-Component tagging lets you name parts of your pages, then filter heatmaps and stats down
-to clicks inside them. Examples: "Hero CTAs", "Pricing cards", "Newsletter form".
+**Two ways to define one:**
 
-**Two ways to tag:**
+1. **CSS selector (primary).** For example `.hero .ctas`, `div.grid > div.card` or
+   `#signup, footer form`, optionally limited to pages by a path pattern (`/products/*`).
+   Nobody has to touch the site's code.
+   - In the dashboard, **pick** an element on a copy of the page and the selector is
+     generated. You can widen it to an ancestor ("component root" chips) or switch
+     between "all similar" and "only this one". You can also build a rule from an element
+     visitors clicked, or type the selector.
+   - A **live match preview** shows, before you save, how many recorded clicks in the
+     selected range the rule tags, on which pages and elements. Invalid selectors show
+     the validation message from the API.
+2. **HTML data attribute.** Developers mark markup, for example
+   `<section data-calor-component="newsletter">`. The tracker records the closest
+   `data-calor-component` value on every click with no configuration. The dashboard lists
+   the values it has seen, so registering one is a single click. Other attributes
+   (`data-x="y"`) can be used too.
 
-1. **CSS selectors (primary).** Define a component in the dashboard with a selector
-   (`.hero .ctas`, `div.grid > div.card`, `#signup`). The selector can be scoped to pages
-   with a path pattern (`/products/*`).
-   - You can type the selector, or pick an element on a live preview of the page and
-     have the selector generated.
-   - A live preview shows how many recorded clicks match before you save.
-2. **HTML data attributes.** Mark elements in your own markup, for example
-   `<section data-calor-component="newsletter">`. The tracker always records the closest
-   `data-calor-component` value, so no configuration is needed. Register the value in the
-   dashboard to give it a name. Other attribute names (`data-x="y"`) also work through
-   the tracker config.
+The rule types can be combined: a click counts when any of them matches. Components may
+nest and overlap, and a click counts for each component that contains it.
 
-**How matching works** (it stays within the small-machine memory budget):
+**History is tagged too.** Creating a component, or changing its rules, tags the clicks
+already recorded. Matching runs in three places:
 
-- **In the tracker:** it fetches the site's selectors once per session from a small
-  cached endpoint and tags each click with the components that contain it.
-- **At ingest:** the server also matches each click's recorded ancestry against the
-  selectors, for clients whose config hasn't loaded yet.
-- **For past data:** creating or editing a component tags historical clicks by matching
-  each distinct recorded element once, not each click.
+- **In the browser:** the tracker loads the site's rules once per session (a few hundred
+  bytes, cached for 5 minutes) and runs `closest()` on each click, which sees the full
+  DOM.
+- **At ingest:** the server matches each click's recorded element path against the rules,
+  for clicks sent before the config loaded.
+- **Retroactively:** on create or rule change, the server scans past clicks in bounded
+  batches and matches each distinct recorded element once.
 
-**Planned dashboard pieces:**
+**Using it:**
 
-- Component list with stats.
-- Create, edit and delete, with the element picker, manual selector entry, attribute
-  entry, and live match preview.
-- A component filter that scopes the heatmap and click stats.
-- A per-component analytics page.
+- **Filter:** choose a component in the filter bar on the overview, pages or page detail
+  view. Click-based numbers (clicks, rage and dead clicks, elements, time of day, the
+  heatmap) are scoped to the component. Pageviews, scroll depth and sessions stay
+  page-wide.
+- **Report:** `/s/{site}/components/{id}` shows clicks, visitors, share of all clicks, the
+  click rate (share of pageviews on matching pages with a click on the component), rage
+  and dead clicks, trend, pages, elements and time of day.
 
-See [`docs/architecture.md`](docs/architecture.md#component-tagging-in-progress) for the
-storage and matching design, and [`docs/api.md`](docs/api.md#component-tagging-in-progress)
-for the planned endpoints.
+**Limits:**
+
+- The server matches the path the tracker recorded: the element plus up to 4 ancestors,
+  up to 6 classes on the element and 2 on each ancestor. Retroactive counts and the
+  preview can therefore be lower than what the tracker tags on live traffic. A selector
+  that depends on a deeper ancestor only tags new clicks.
+- Supported selector syntax: tag, `*`, `#id`, `.class`, `[attr]`, `[attr=value]`,
+  `:nth-of-type(n)`, descendant and `>` combinators, and comma lists. Selectors are at
+  most 300 characters, with at most 10 alternatives of up to 8 compounds. Sibling
+  combinators, `:hover`-style state and other pseudo-classes are rejected with an
+  explanation.
+- The tracker doesn't record arbitrary attributes. Attribute rules other than
+  `data-calor-component`, and selectors containing attribute tests such as
+  `[type=submit]`, are therefore checked only in the browser and tag new traffic only.
+  The preview says so. Clicks recorded before this feature have no
+  `data-calor-component` value.
+- At most 200 components per site. Names and attribute values are unique per site
+  (409 otherwise).
+- The dashboard editor uses one rule type per component, although the API accepts a
+  selector and an attribute together.
+
+See [`docs/architecture.md`](docs/architecture.md#component-tagging) for storage and
+matching, and [`docs/api.md`](docs/api.md#component-tagging) for the endpoints.
 
 ## API summary
 
@@ -293,9 +337,11 @@ for the planned endpoints.
 | `GET /api/sites/{site}/kpis`, `daily`, `time-of-day`, `scroll`, `devices`, `pages`, `elements`, `entry-exit`, `referrers`, `flow`, `heatmap` | analytics, filtered by `from`, `to`, `tz`, `device`, `url` |
 | `GET/PUT/DELETE /api/sites/{site}/screenshot?url=` | page screenshots used as heatmap backgrounds |
 | `GET /api/compare?sites=a,b` | cross-site comparison |
-| `/api/sites/{site}/components…` | component tagging (in progress) |
+| `GET/POST /api/sites/{site}/components`, `GET/PATCH/DELETE …/components/{id}`, `…/components/{id}/stats`, `POST …/components/preview`, `GET …/components/discovered` | component tagging; analytics routes also accept `component=` |
+| `GET /api/sites/{site}/tracker-config` | public: the component rules the tracker evaluates (cached 5 min) |
 
-Everything except ingest, health and the tracker files needs the admin key. The full
+Everything except ingest, health, the tracker files and the tracker config needs the
+admin key. The full
 reference, with parameters, status codes and the wire format, is in
 [`docs/api.md`](docs/api.md).
 
@@ -312,7 +358,7 @@ dashboard and the demo server on one machine:
 | Load-test throughput | 9,054 events/s accepted, 0 errors (503 backpressure when the queue fills); queries p50 0.6 ms, p95 43 ms |
 | Ingest only | ~15k events/s |
 | Dashboard RSS, idle / after browsing | **81 MiB** / 127 MiB (peak 133 MiB) |
-| Tracker | 5,246 B minified, **2,584 B gzip** |
+| Tracker | 6,208 B minified, **3,011 B gzip** |
 | Dashboard first-load JS per route | 137–141 KiB gzip. The heatmap chunk (+2.6 KiB) loads only on page detail |
 | Binaries | `calor-api` 9.6 MB static; standalone dashboard 64 MB on disk |
 
@@ -405,4 +451,4 @@ Docker wasn't available in the environment where this was built.
   can take a while, and the database file doesn't shrink until you run `VACUUM`.
 - **Docker** files are untested (see above). systemd and `make start` are the tested
   paths.
-- **Component tagging** is in progress (see above).
+- **Component tagging** has the limits listed in [its section](#component-tagging).

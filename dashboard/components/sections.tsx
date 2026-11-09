@@ -330,6 +330,7 @@ export async function HeatmapSection({ site, f, url }: P & { url: string }) {
   if (err) return <ErrorNote error={err} />;
   const query: Record<string, string> = { from: f.from, to: f.to, tz: String(f.tz) };
   if (f.device) query.device = f.device;
+  if (f.component) query.component = f.component;
   return (
     <HeatmapLoader
       site={site}

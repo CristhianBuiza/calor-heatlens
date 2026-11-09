@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import { DevicesSection, ElementsSection, EntryExitSection, KpiSection, PagesTableSection, ReferrersSection, ScrollSection, TimeOfDaySection, TrendSection } from '@/components/sections';
+import { ComponentScope, ScopeBanner } from '@/components/ComponentScope';
 import { Card, Lazy } from '@/components/ui';
 import { filterQuery, readFilters } from '@/lib/filters';
 import { getSite } from '@/lib/site';
@@ -20,7 +21,9 @@ export default async function Overview(props: PageProps<'/s/[site]'>) {
             {f.device ? ` · ${f.device} only` : ''}
           </p>
         </div>
+        <ComponentScope site={site.id} f={f} />
       </div>
+      <ScopeBanner site={site.id} f={f} path={`/s/${site.id}`} />
       <div id="overview-kpis">
         <Lazy height={190}>
           <KpiSection {...p} />

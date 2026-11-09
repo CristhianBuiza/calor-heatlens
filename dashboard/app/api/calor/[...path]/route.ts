@@ -2,10 +2,11 @@ import { NextRequest } from 'next/server';
 import { API_URL, authHeaders } from '@/lib/api';
 
 // Browser-facing proxy for the few API calls client components make. Only
-// allow-listed, site-scoped read paths (plus screenshot upload) are forwarded,
-// and the admin key is added server-side.
+// allow-listed, site-scoped read paths (plus screenshot upload and the
+// component match preview) are forwarded, and the admin key is added server-side.
 const READ = /^sites\/[A-Za-z0-9_-]{1,64}\/(heatmap|elements|screenshot|screenshot\/meta)$/;
 const WRITE = /^sites\/[A-Za-z0-9_-]{1,64}\/screenshot$/;
+const PREVIEW = /^sites\/[A-Za-z0-9_-]{1,64}\/components\/preview$/;
 
 type Ctx = { params: Promise<{ path: string[] }> };
 
@@ -32,4 +33,10 @@ export async function PUT(req: NextRequest, ctx: Ctx) {
   const body = await req.arrayBuffer();
   if (body.byteLength > 8 << 20) return Response.json({ error: 'screenshot larger than 8 MiB' }, { status: 413 });
   return forward(req, ctx, WRITE, { method: 'PUT', body, headers: { 'Content-Type': req.headers.get('content-type') || 'application/octet-stream' } });
+}
+
+export async function POST(req: NextRequest, ctx: Ctx) {
+  const body = await req.text();
+  if (body.length > 16 << 10) return Response.json({ error: 'body too large' }, { status: 413 });
+  return forward(req, ctx, PREVIEW, { method: 'POST', body, headers: { 'Content-Type': 'application/json' } });
 }
