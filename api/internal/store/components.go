@@ -219,7 +219,7 @@ func (s *Store) DeleteComponent(ctx context.Context, siteID, id string) error {
 }
 
 func (s *Store) clearComponentTags(ctx context.Context, id string) error {
-	_, err := s.deleteChunked(ctx, "event_components", "component_id, ts, event_id", "component_id = ?", id)
+	_, err := s.deleteChunked(ctx, "event_components", "component_id = ?", id)
 	return err
 }
 

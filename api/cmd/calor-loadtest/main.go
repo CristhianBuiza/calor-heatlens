@@ -7,9 +7,11 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/rand"
 	"net/http"
 	"os"
@@ -80,16 +82,18 @@ func pgMemKB() (kb int, field string) {
 		if err != nil || strings.TrimSpace(string(comm)) != "postgres" {
 			continue
 		}
-		rss += rssKB(pid, "VmRSS")
-		if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/smaps_rollup", pid)); err == nil {
-			for _, line := range strings.Split(string(b), "\n") {
-				if f := strings.Fields(line); len(f) >= 2 && f[0] == "Pss:" {
-					n, _ := strconv.Atoi(f[1])
-					pss += n
-				}
-			}
-		} else {
+		b, err := os.ReadFile(fmt.Sprintf("/proc/%d/smaps_rollup", pid))
+		if errors.Is(err, fs.ErrPermission) {
 			pssOK = false
+		} else if err != nil {
+			continue // exited since the directory listing (short-lived backends)
+		}
+		rss += rssKB(pid, "VmRSS")
+		for _, line := range strings.Split(string(b), "\n") {
+			if f := strings.Fields(line); len(f) >= 2 && f[0] == "Pss:" {
+				n, _ := strconv.Atoi(f[1])
+				pss += n
+			}
 		}
 	}
 	if pssOK && pss > 0 {
@@ -108,7 +112,9 @@ func main() {
 	pages := flag.Int("pages", 40, "distinct pages")
 	pid := flag.Int("pid", 0, "API pid to sample RSS from /proc")
 	keep := flag.Bool("keep", false, "keep the loadtest site and its events afterwards")
+	reuse := flag.Bool("reuse", false, "add to the loadtest site kept by an earlier -keep run instead of starting empty (implies -keep)")
 	pgMem := flag.Bool("pg", false, "also sample the summed memory of local postgres processes")
+	rate := flag.Int("rate", 0, "cap ingest at about this many events/s across all workers (0: as fast as the API accepts)")
 	flag.Parse()
 
 	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: 64}}
@@ -120,16 +126,20 @@ func main() {
 			res.Body.Close()
 		}
 	}
-	// Start from an empty site so every run measures the same thing.
-	deleteSite()
-	body, _ := json.Marshal(map[string]string{"id": site, "name": "Load test", "domain": "loadtest.local"})
-	req, _ := http.NewRequest("POST", *api+"/api/sites", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+*key)
-	if res, err := client.Do(req); err != nil {
-		fmt.Fprintln(os.Stderr, "register site:", err)
-		os.Exit(1)
+	if *reuse {
+		*keep = true
 	} else {
-		res.Body.Close()
+		// Start from an empty site so every run measures the same thing.
+		deleteSite()
+		body, _ := json.Marshal(map[string]string{"id": site, "name": "Load test", "domain": "loadtest.local"})
+		req, _ := http.NewRequest("POST", *api+"/api/sites", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+*key)
+		if res, err := client.Do(req); err != nil {
+			fmt.Fprintln(os.Stderr, "register site:", err)
+			os.Exit(1)
+		} else {
+			res.Body.Close()
+		}
 	}
 
 	var ing, qry stats
@@ -170,12 +180,26 @@ func main() {
 		}()
 	}
 
+	run := time.Now().Unix() % 1e6 // keeps session and pageview ids unique across -reuse runs
+	var tokens <-chan time.Time
+	if *rate > 0 {
+		t := time.NewTicker(time.Duration(float64(time.Second) * float64(*batch) / float64(*rate)))
+		defer t.Stop()
+		tokens = t.C
+	}
 	for w := 0; w < *ingestC; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			r := rand.New(rand.NewSource(int64(w)))
 			for i := 0; ; i++ {
+				if tokens != nil {
+					select {
+					case <-stop:
+						return
+					case <-tokens:
+					}
+				}
 				select {
 				case <-stop:
 					return
@@ -183,7 +207,7 @@ func main() {
 				}
 				page := fmt.Sprintf("https://loadtest.local/p/%d", r.Intn(*pages))
 				var sb strings.Builder
-				fmt.Fprintf(&sb, `{"v":1,"site":%q,"sid":"w%ds%d","ts":%d,"u":%q,"p":"pv%d_%d","vw":1440,"vh":900,"e":[`, site, w, i/10, time.Now().UnixMilli(), page, w, i)
+				fmt.Fprintf(&sb, `{"v":1,"site":%q,"sid":"r%dw%ds%d","ts":%d,"u":%q,"p":"pv%d_%d_%d","vw":1440,"vh":900,"e":[`, site, run, w, i/10, time.Now().UnixMilli(), page, run, w, i)
 				for j := 0; j < *batch; j++ {
 					if j > 0 {
 						sb.WriteByte(',')
@@ -226,23 +250,28 @@ func main() {
 	}
 
 	queries := []string{"kpis", "pages?sort=clicks", "elements", "time-of-day", "scroll", "daily", "entry-exit", "heatmap?url=https://loadtest.local/p/1&cols=100&rows=220", "heatmap?url=https://loadtest.local/p/2&cols=100&rows=220&from=" + strconv.FormatInt(time.Now().Add(-time.Hour).UnixMilli()+1, 10)}
+	// One counter across workers: each (query, tz) pair recurs only every
+	// len(queries)*600 requests, well beyond the API's 15 s cache TTL at these
+	// rates, so every query hits the database. (A per-worker counter made
+	// workers request each other's URLs and measured cache timing instead.)
+	var seq, cacheHits atomic.Int64
 	for w := 0; w < *queryC; w++ {
 		wg.Add(1)
-		go func(w int) {
+		go func() {
 			defer wg.Done()
-			for i := w; ; i++ {
+			for {
 				select {
 				case <-stop:
 					return
 				default:
 				}
+				i := int(seq.Add(1) - 1)
 				q := queries[i%len(queries)]
 				sep := "?"
 				if strings.Contains(q, "?") {
 					sep = "&"
 				}
-				// Unique cache-busting parameter so every query hits the database.
-				req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/sites/%s/%s%stz=%d", *api, site, q, sep, i%600), nil)
+				req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/sites/%s/%s%stz=%d", *api, site, q, sep, (i/len(queries))%600), nil)
 				req.Header.Set("Authorization", "Bearer "+*key)
 				req.Header.Set("Accept-Encoding", "gzip")
 				t0 := time.Now()
@@ -253,19 +282,26 @@ func main() {
 					res.Body.Close()
 				}
 				qry.add(time.Since(t0), ok)
+				if ok && res.Header.Get("X-Cache") == "hit" {
+					cacheHits.Add(1)
+				}
 			}
-		}(w)
+		}()
 	}
 
 	time.Sleep(*dur)
 	close(stop)
 	wg.Wait()
 	secs := dur.Seconds()
-	fmt.Printf("duration            %s (ingest workers %d, query workers %d, %d events/request)\n", *dur, *ingestC, *queryC, *batch)
+	capped := ""
+	if *rate > 0 {
+		capped = fmt.Sprintf(", ingest capped at %d events/s", *rate)
+	}
+	fmt.Printf("duration            %s (ingest workers %d, query workers %d, %d events/request%s)\n", *dur, *ingestC, *queryC, *batch, capped)
 	fmt.Printf("ingest requests     %d (%.0f req/s, %.0f events/s, %d errors, %d throttled with 503)  p50 %s  p95 %s  p99 %s\n",
 		ing.n, float64(ing.n)/secs, float64(events.Load())/secs, ing.errs, throttled.Load(), ing.pct(.5), ing.pct(.95), ing.pct(.99))
-	fmt.Printf("query requests      %d (%.1f req/s, %d errors)  p50 %s  p95 %s  p99 %s\n",
-		qry.n, float64(qry.n)/secs, qry.errs, qry.pct(.5), qry.pct(.95), qry.pct(.99))
+	fmt.Printf("query requests      %d (%.1f req/s, %d errors, %d cache hits)  p50 %s  p95 %s  p99 %s\n",
+		qry.n, float64(qry.n)/secs, qry.errs, cacheHits.Load(), qry.pct(.5), qry.pct(.95), qry.pct(.99))
 	if !*keep {
 		defer deleteSite()
 	}

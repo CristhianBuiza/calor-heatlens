@@ -35,13 +35,16 @@ function pgMem() {
     if (!/^\d+$/.test(d)) continue;
     try {
       if (readFileSync(`/proc/${d}/comm`, 'utf8').trim() !== 'postgres') continue;
-      rss += Number(readFileSync(`/proc/${d}/status`, 'utf8').match(/VmRSS:\s+(\d+)/)[1]);
-      n++;
+      let smaps = '';
       try {
-        pss += Number(readFileSync(`/proc/${d}/smaps_rollup`, 'utf8').match(/Pss:\s+(\d+)/)[1]);
-      } catch {
+        smaps = readFileSync(`/proc/${d}/smaps_rollup`, 'utf8');
+      } catch (e) {
+        if (e.code !== 'EACCES') continue; // exited since the directory listing
         pssOk = false;
       }
+      rss += Number(readFileSync(`/proc/${d}/status`, 'utf8').match(/VmRSS:\s+(\d+)/)[1]);
+      n++;
+      if (smaps) pss += Number(smaps.match(/Pss:\s+(\d+)/)[1]);
     } catch {}
   }
   if (!n) return null;

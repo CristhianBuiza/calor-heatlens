@@ -371,9 +371,9 @@ func (s *Store) ExitPoints(ctx context.Context, f Filter, limit int) ([]ExitPoin
 			COALESCE(lc.el_id, ''), COALESCE(lc.el_tag, ''), COUNT(*),
 			(SUM(COUNT(*)) OVER ())::bigint
 		FROM last_pv l LEFT JOIN LATERAL (
-			-- A per-pageview probe of idx_events_pageview. The planner can't
-			-- estimate last_pv, and a window-ranked join turned into a nested
-			-- loop over every click.
+			-- One probe of idx_events_site_type_pageview per pageview. The
+			-- planner can't estimate last_pv, and a window-ranked join became a
+			-- nested loop over every click.
 			SELECT e.selector, e.el_label, e.el_text, e.el_id, e.el_tag FROM events e
 			WHERE e.pageview_id = l.pageview_id AND e.site_id = ? AND e.type = 'click'
 			ORDER BY e.ts DESC, e.id DESC LIMIT 1

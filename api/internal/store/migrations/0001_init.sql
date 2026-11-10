@@ -52,7 +52,11 @@ CREATE TABLE events (
 CREATE INDEX idx_events_site_type_ts ON events (site_id, type, ts);
 CREATE INDEX idx_events_site_page_type_ts ON events (site_id, page_url, type, ts);
 CREATE INDEX idx_events_site_session_ts ON events (site_id, session_id, ts);
-CREATE INDEX idx_events_pageview ON events (pageview_id);
+-- The last click of a pageview (exit points). Leading with the columns of
+-- idx_events_site_type_ts keeps the planner off that index, which looks just as
+-- cheap for a new site whose statistics are still stale and then scans every
+-- click of the site per pageview.
+CREATE INDEX idx_events_site_type_pageview ON events (site_id, type, pageview_id, ts, id);
 -- Tiny block-range index for the retention delete of the boundary month.
 CREATE INDEX idx_events_ts_brin ON events USING brin (ts);
 

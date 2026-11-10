@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // Event types.
@@ -249,11 +250,11 @@ func (s *Store) PruneEvents(ctx context.Context, cutoff int64) (int64, error) {
 		return n, err
 	}
 	for _, id := range ids {
-		if _, err := s.deleteChunked(ctx, "event_components", "component_id, ts, event_id", "component_id = ? AND ts < ?", id, cutoff); err != nil {
+		if _, err := s.deleteChunked(ctx, "event_components", "component_id = ? AND ts < ?", id, cutoff); err != nil {
 			return n, err
 		}
 	}
-	m, err := s.deleteChunked(ctx, "events", "id, ts", "ts < ?", cutoff)
+	m, err := s.deleteChunked(ctx, "events", "ts < ?", cutoff)
 	return n + m, err
 }
 
@@ -262,25 +263,63 @@ func (s *Store) PruneEvents(ctx context.Context, cutoff int64) (int64, error) {
 // autovacuum only sees at the end.
 var deleteChunk = 5000
 
-// deleteChunked deletes the rows of table matching where, deleteChunk rows
-// (identified by the key columns, which must be indexed) per statement. The
-// condition is repeated on the outer DELETE so partitions get pruned.
-func (s *Store) deleteChunked(ctx context.Context, table, key, where string, args ...any) (int64, error) {
-	q := `DELETE FROM ` + table + ` WHERE ` + where + ` AND (` + key + `) IN (SELECT ` + key + ` FROM ` + table +
-		` WHERE ` + where + ` LIMIT ` + strconv.Itoa(deleteChunk) + `)`
-	args = append(append([]any{}, args...), args...)
+// deleteChunked deletes the rows of table matching where, deleteChunk rows per
+// transaction. Each chunk selects the physical row ids (partition, ctid) of
+// matching rows and deletes them per partition with a TID scan. A
+// `DELETE … WHERE key IN (SELECT key … LIMIT n)` semi-join instead turns into
+// a nested loop over every matching row whenever statistics underestimate
+// them, as they do for a site created since the last ANALYZE. where is
+// re-checked on delete, so a ctid reused by a new row in between is skipped.
+func (s *Store) deleteChunked(ctx context.Context, table, where string, args ...any) (int64, error) {
+	sel := rebind(`SELECT tableoid::regclass::text, ctid FROM ` + table + ` WHERE ` + where + ` LIMIT ` + strconv.Itoa(deleteChunk))
 	var total int64
 	for {
-		tag, err := s.exec(ctx, q, args...)
-		if err != nil {
+		found, n, err := s.deleteChunk(ctx, sel, where, args)
+		total += n
+		if err != nil || found < deleteChunk {
 			return total, err
 		}
-		n := tag.RowsAffected()
-		total += n
-		if n < int64(deleteChunk) {
-			return total, nil
-		}
 	}
+}
+
+func (s *Store) deleteChunk(ctx context.Context, sel, where string, args []any) (found int, deleted int64, err error) {
+	tx, err := s.w.Begin(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, sel, args...)
+	if err != nil {
+		return 0, 0, err
+	}
+	byPart := map[string][]pgtype.TID{}
+	var order []string
+	for rows.Next() {
+		var part string
+		var tid pgtype.TID
+		if err := rows.Scan(&part, &tid); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		if _, ok := byPart[part]; !ok {
+			order = append(order, part)
+		}
+		byPart[part] = append(byPart[part], tid)
+		found++
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+	for _, part := range order {
+		tag, err := tx.Exec(ctx, rebind(`DELETE FROM `+part+` WHERE ctid = ANY(?::tid[]) AND `+where),
+			append([]any{byPart[part]}, args...)...)
+		if err != nil {
+			return 0, 0, err
+		}
+		deleted += tag.RowsAffected()
+	}
+	return found, deleted, tx.Commit(ctx)
 }
 
 // ---- sites ----
@@ -364,10 +403,10 @@ func (s *Store) DeleteSite(ctx context.Context, id string) error {
 			return err
 		}
 	}
-	if _, err := s.deleteChunked(ctx, "events", "id, ts", "site_id = ?", id); err != nil {
+	if _, err := s.deleteChunked(ctx, "events", "site_id = ?", id); err != nil {
 		return err
 	}
-	if _, err := s.deleteChunked(ctx, "heatmap_rollup", "site_id, page_url, type, device, hour, gx, gy", "site_id = ?", id); err != nil {
+	if _, err := s.deleteChunked(ctx, "heatmap_rollup", "site_id = ?", id); err != nil {
 		return err
 	}
 	_, err = s.exec(ctx, `DELETE FROM sites WHERE id = ?`, id)

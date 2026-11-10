@@ -196,3 +196,30 @@ func TestEventIDsFollowBatchOrder(t *testing.T) {
 		}
 	}
 }
+
+// Row ids (ctids) repeat across partitions: deleting one site's rows chunk by
+// chunk must not touch another site's rows at the same ctid in another month.
+func TestDeleteSiteAcrossPartitionsKeepsOtherSites(t *testing.T) {
+	s := newTestStore(t, "a", "b")
+	page := "https://a.test/"
+	mustInsert(t, s, click("a", page, "s1", "p1", monthTS(2026, 1, 10), 1, 1))
+	mustInsert(t, s, click("b", "https://b.test/", "s2", "p2", monthTS(2026, 2, 10), 1, 1))
+	mustInsert(t, s, click("b", "https://b.test/", "s3", "p3", monthTS(2026, 1, 11), 1, 1))
+	mustInsert(t, s, click("a", page, "s4", "p4", monthTS(2026, 2, 11), 1, 1))
+	var shared int
+	s.r.QueryRow(ctx, `SELECT COUNT(*) FROM (SELECT ctid FROM events GROUP BY ctid HAVING COUNT(*) > 1) d`).Scan(&shared)
+	if shared == 0 {
+		t.Fatal("test setup: expected rows of different partitions to share a ctid")
+	}
+
+	defer func(n int) { deleteChunk = n }(deleteChunk)
+	deleteChunk = 1
+	if err := s.DeleteSite(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	var a, b int
+	s.r.QueryRow(ctx, `SELECT COUNT(*) FILTER (WHERE site_id = 'a'), COUNT(*) FILTER (WHERE site_id = 'b') FROM events`).Scan(&a, &b)
+	if a != 0 || b != 2 {
+		t.Errorf("after deleting site a: %d events of a, %d of b; want 0 and 2", a, b)
+	}
+}
