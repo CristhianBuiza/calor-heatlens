@@ -13,12 +13,12 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"calor/api/internal/store"
+	"calor/api/internal/store/pgtest"
 )
 
 const key = "test-key"
@@ -31,7 +31,7 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "api.db"), store.Options{})
+	st, err := store.Open(ctxBG(), pgtest.DSN(t), store.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +282,7 @@ func TestSiteScopedAnalyticsEndpoints(t *testing.T) {
 }
 
 func TestResponseCacheAndGzip(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "c.db"), store.Options{})
+	st, err := store.Open(ctxBG(), pgtest.DSN(t), store.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

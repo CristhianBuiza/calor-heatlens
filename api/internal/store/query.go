@@ -111,14 +111,14 @@ type KPIs struct {
 func (s *Store) KPIs(ctx context.Context, f Filter) (KPIs, error) {
 	var k KPIs
 	c := f.base(true)
-	err := s.r.QueryRowContext(ctx, `SELECT
-		COALESCE(SUM(type = 'click'), 0),
-		COALESCE(SUM(type = 'pageview'), 0),
+	err := s.queryRow(ctx, `SELECT
+		COUNT(*) FILTER (WHERE type = 'click'),
+		COUNT(*) FILTER (WHERE type = 'pageview'),
 		COUNT(DISTINCT session_id),
 		COUNT(DISTINCT page_url),
-		COALESCE(SUM(type = 'click' AND rage = 1), 0),
-		COALESCE(SUM(type = 'click' AND dead = 1), 0),
-		COALESCE(SUM(type = 'navigation' AND nav_kind IN ('link','pushstate','replacestate','popstate')), 0)
+		COUNT(*) FILTER (WHERE type = 'click' AND rage),
+		COUNT(*) FILTER (WHERE type = 'click' AND dead),
+		COUNT(*) FILTER (WHERE type = 'navigation' AND nav_kind IN ('link','pushstate','replacestate','popstate'))
 		FROM events`+c.sql(), c.args...).
 		Scan(&k.Clicks, &k.Pageviews, &k.UniqueVisitors, &k.Pages, &k.RageClicks, &k.DeadClicks, &k.Navigations)
 	if err != nil {
@@ -180,7 +180,7 @@ func (s *Store) scroll(ctx context.Context, f Filter) (ScrollStats, map[string]*
 	c := f.base(true)
 	c.add("type IN ('pageview','scroll')")
 	c.add("pageview_id <> ''")
-	rows, err := s.r.QueryContext(ctx, `SELECT MAX(page_url), MAX(COALESCE(scroll_depth, 0)), MAX(duration_ms)
+	rows, err := s.query(ctx, `SELECT MAX(page_url), MAX(COALESCE(scroll_depth, 0)), MAX(duration_ms)
 		FROM events`+c.sql()+` GROUP BY pageview_id`, c.args...)
 	if err != nil {
 		return ScrollStats{}, nil, err
@@ -266,14 +266,15 @@ type sessionTotals struct{ Sessions, Bounces, Pageviews int64 }
 func (s *Store) entryExit(ctx context.Context, f Filter) (map[string]pageEntryExit, sessionTotals, error) {
 	c := f.base(false)
 	c.add("type = 'pageview'")
-	rows, err := s.r.QueryContext(ctx, `WITH pv AS (
+	rows, err := s.query(ctx, `WITH pv AS (
 			SELECT page_url,
 				ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ts, id) AS rf,
 				ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ts DESC, id DESC) AS rl,
 				COUNT(*) OVER (PARTITION BY session_id) AS c
 			FROM events`+c.sql()+`
 		)
-		SELECT page_url, SUM(rf = 1), SUM(rl = 1), SUM(rf = 1 AND c = 1), SUM(CASE WHEN rf = 1 THEN c ELSE 0 END)
+		SELECT page_url, COUNT(*) FILTER (WHERE rf = 1), COUNT(*) FILTER (WHERE rl = 1), COUNT(*) FILTER (WHERE rf = 1 AND c = 1),
+			COALESCE(SUM(c) FILTER (WHERE rf = 1), 0)::bigint
 		FROM pv WHERE rf = 1 OR rl = 1 GROUP BY page_url`, c.args...)
 	if err != nil {
 		return nil, sessionTotals{}, err
@@ -359,12 +360,12 @@ func (s *Store) ExitPoints(ctx context.Context, f Filter, limit int) ([]ExitPoin
 	c.add("type = 'pageview'")
 	args := append([]any{}, c.args...)
 	args = append(args, f.PageURL, f.PageURL, f.SiteID, limit)
-	rows, err := s.r.QueryContext(ctx, `WITH last_pv AS (
+	rows, err := s.query(ctx, `WITH last_pv AS (
 			SELECT pageview_id, page_url FROM (
 				SELECT pageview_id, page_url,
 					ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ts DESC, id DESC) AS rn
 				FROM events`+c.sql()+`
-			) WHERE rn = 1 AND (? = '' OR page_url = ?)
+			) ranked WHERE rn = 1 AND (?::text = '' OR page_url = ?)
 		), last_click AS (
 			SELECT e.pageview_id, e.selector, e.el_label, e.el_text, e.el_id, e.el_tag,
 				ROW_NUMBER() OVER (PARTITION BY e.pageview_id ORDER BY e.ts DESC, e.id DESC) AS rn
@@ -373,7 +374,7 @@ func (s *Store) ExitPoints(ctx context.Context, f Filter, limit int) ([]ExitPoin
 		)
 		SELECT l.page_url, COALESCE(lc.selector, ''), COALESCE(lc.el_label, ''), COALESCE(lc.el_text, ''),
 			COALESCE(lc.el_id, ''), COALESCE(lc.el_tag, ''), COUNT(*),
-			SUM(COUNT(*)) OVER ()
+			(SUM(COUNT(*)) OVER ())::bigint
 		FROM last_pv l LEFT JOIN last_click lc ON lc.pageview_id = l.pageview_id AND lc.rn = 1
 		GROUP BY 1, 2, 3, 4, 5, 6
 		ORDER BY 7 DESC, 1, 2 LIMIT ?`, args...)
@@ -452,11 +453,11 @@ func pathOf(u string) string {
 func (s *Store) Pages(ctx context.Context, f Filter, q PageQuery) (PageList, error) {
 	c := f.base(false)
 	if q.Search != "" {
-		c.add("instr(page_url, ?) > 0", q.Search)
+		c.add("strpos(page_url, ?) > 0", q.Search)
 	}
-	rows, err := s.r.QueryContext(ctx, `SELECT page_url,
-		COALESCE(SUM(type = 'click'), 0), COALESCE(SUM(type = 'pageview'), 0), COUNT(DISTINCT session_id),
-		COALESCE(SUM(type = 'click' AND rage = 1), 0), COALESCE(SUM(type = 'click' AND dead = 1), 0),
+	rows, err := s.query(ctx, `SELECT page_url,
+		COUNT(*) FILTER (WHERE type = 'click'), COUNT(*) FILTER (WHERE type = 'pageview'), COUNT(DISTINCT session_id),
+		COUNT(*) FILTER (WHERE type = 'click' AND rage), COUNT(*) FILTER (WHERE type = 'click' AND dead),
 		MIN(ts), MAX(ts)
 		FROM events`+c.sql()+` GROUP BY page_url`, c.args...)
 	if err != nil {
@@ -568,8 +569,8 @@ func (s *Store) Daily(ctx context.Context, f Filter) ([]Day, error) {
 	c := f.base(true)
 	off := f.tzSeconds()
 	args := append([]any{off}, c.args...)
-	rows, err := s.r.QueryContext(ctx, `SELECT (ts / 1000 + ?) / 86400 AS d,
-		COALESCE(SUM(type = 'click'), 0), COALESCE(SUM(type = 'pageview'), 0), COUNT(DISTINCT session_id)
+	rows, err := s.query(ctx, `SELECT (ts / 1000 + ?::bigint) / 86400 AS d,
+		COUNT(*) FILTER (WHERE type = 'click'), COUNT(*) FILTER (WHERE type = 'pageview'), COUNT(DISTINCT session_id)
 		FROM events`+c.sql()+` GROUP BY d ORDER BY d`, args...)
 	if err != nil {
 		return nil, err
@@ -629,7 +630,7 @@ func (s *Store) TimeOfDay(ctx context.Context, f Filter) (TimeOfDay, error) {
 	c.add("type = 'click'")
 	off := f.tzSeconds()
 	args := append([]any{off, off}, c.args...)
-	rows, err := s.r.QueryContext(ctx, `SELECT ((ts / 1000 + ?) / 86400 + 4) % 7 AS dow, ((ts / 1000 + ?) % 86400) / 3600 AS h, COUNT(*)
+	rows, err := s.query(ctx, `SELECT ((ts / 1000 + ?::bigint) / 86400 + 4) % 7 AS dow, ((ts / 1000 + ?::bigint) % 86400) / 3600 AS h, COUNT(*)
 		FROM events`+c.sql()+` GROUP BY dow, h`, args...)
 	if err != nil {
 		return TimeOfDay{}, err
@@ -676,9 +677,9 @@ type DeviceStat struct {
 func (s *Store) Devices(ctx context.Context, f Filter) ([]DeviceStat, error) {
 	f.Device = ""
 	c := f.base(true)
-	rows, err := s.r.QueryContext(ctx, `SELECT
+	rows, err := s.query(ctx, `SELECT
 		CASE WHEN viewport_w <= 0 THEN 'unknown' WHEN viewport_w < 768 THEN 'mobile' WHEN viewport_w < 1024 THEN 'tablet' ELSE 'desktop' END AS dev,
-		COALESCE(SUM(type = 'pageview'), 0), COUNT(DISTINCT session_id), COALESCE(SUM(type = 'click'), 0)
+		COUNT(*) FILTER (WHERE type = 'pageview'), COUNT(DISTINCT session_id), COUNT(*) FILTER (WHERE type = 'click')
 		FROM events`+c.sql()+` GROUP BY dev ORDER BY 2 DESC`, c.args...)
 	if err != nil {
 		return nil, err
@@ -744,12 +745,12 @@ func (s *Store) Elements(ctx context.Context, f Filter, limit, offset int) (Elem
 	c := f.base(true)
 	c.add("type = 'click'")
 	var total int64
-	if err := s.r.QueryRowContext(ctx, `SELECT COUNT(*) FROM events`+c.sql(), c.args...).Scan(&total); err != nil {
+	if err := s.queryRow(ctx, `SELECT COUNT(*) FROM events`+c.sql(), c.args...).Scan(&total); err != nil {
 		return ElementList{}, err
 	}
 	args := append(append([]any{}, c.args...), limit, offset)
-	rows, err := s.r.QueryContext(ctx, `SELECT page_url, selector, el_tag, el_id, el_classes, el_text, el_label,
-		COUNT(*), COUNT(DISTINCT session_id), SUM(rage), SUM(dead),
+	rows, err := s.query(ctx, `SELECT page_url, selector, el_tag, el_id, el_classes, el_text, el_label,
+		COUNT(*), COUNT(DISTINCT session_id), COUNT(*) FILTER (WHERE rage), COUNT(*) FILTER (WHERE dead),
 		COALESCE(AVG(x / NULLIF(doc_w, 0)), 0), COALESCE(AVG(y / NULLIF(doc_h, 0)), 0)
 		FROM events`+c.sql()+`
 		GROUP BY page_url, selector, el_tag, el_id, el_classes, el_text, el_label
@@ -799,7 +800,7 @@ func (s *Store) Flow(ctx context.Context, f Filter, limit int) (Flow, error) {
 
 	c := f.base(true)
 	c.add("type = 'pageview'")
-	rows, err := s.r.QueryContext(ctx, `SELECT referrer, nav_kind, COUNT(*), SUM(COUNT(*)) OVER ()
+	rows, err := s.query(ctx, `SELECT referrer, nav_kind, COUNT(*), (SUM(COUNT(*)) OVER ())::bigint
 		FROM events`+c.sql()+` GROUP BY referrer, nav_kind ORDER BY 3 DESC LIMIT ?`, append(c.args, limit)...)
 	if err != nil {
 		return out, err
@@ -821,11 +822,14 @@ func (s *Store) Flow(ctx context.Context, f Filter, limit int) (Flow, error) {
 		out.Inbound = append(out.Inbound, e)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
 
 	c = f.base(true)
 	c.add("type = 'navigation'")
 	c.add("nav_kind IN ('link','pushstate','replacestate','popstate')")
-	rows, err = s.r.QueryContext(ctx, `SELECT target_url, nav_kind, COUNT(*), SUM(COUNT(*)) OVER ()
+	rows, err = s.query(ctx, `SELECT target_url, nav_kind, COUNT(*), (SUM(COUNT(*)) OVER ())::bigint
 		FROM events`+c.sql()+` GROUP BY target_url, nav_kind ORDER BY 3 DESC LIMIT ?`, append(c.args, limit)...)
 	if err != nil {
 		return out, err
@@ -842,11 +846,14 @@ func (s *Store) Flow(ctx context.Context, f Filter, limit int) (Flow, error) {
 		out.Outbound = append(out.Outbound, e)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
 
 	c = f.base(true)
 	c.add("type = 'navigation'")
 	c.add("nav_kind = 'unload'")
-	if err := s.r.QueryRowContext(ctx, `SELECT COUNT(*) FROM events`+c.sql(), c.args...).Scan(&out.Unloads); err != nil {
+	if err := s.queryRow(ctx, `SELECT COUNT(*) FROM events`+c.sql(), c.args...).Scan(&out.Unloads); err != nil {
 		return out, err
 	}
 	out.ExitPoints, err = s.ExitPoints(ctx, f, limit)
@@ -867,7 +874,7 @@ func (s *Store) Referrers(ctx context.Context, f Filter, siteDomain string, limi
 	c := f.base(true)
 	c.add("type = 'pageview'")
 	c.add("nav_kind = 'load'")
-	rows, err := s.r.QueryContext(ctx, `SELECT referrer, COUNT(*) FROM events`+c.sql()+` GROUP BY referrer`, c.args...)
+	rows, err := s.query(ctx, `SELECT referrer, COUNT(*) FROM events`+c.sql()+` GROUP BY referrer`, c.args...)
 	if err != nil {
 		return nil, err
 	}
@@ -975,7 +982,7 @@ func (s *Store) Heatmap(ctx context.Context, f Filter, cols, rows int) (Heatmap,
 		if f.Device != "" {
 			c.add("device = ?", f.Device)
 		}
-		q = `SELECT MIN(gx * ? / ` + itoa(RollupCols) + `, ? - 1) AS cx, MIN(gy * ? / ` + itoa(RollupRows) + `, ? - 1) AS cy, SUM(n)
+		q = `SELECT LEAST(gx * ?::integer / ` + itoa(RollupCols) + `, ?::integer - 1) AS cx, LEAST(gy * ?::integer / ` + itoa(RollupRows) + `, ?::integer - 1) AS cy, SUM(n)
 			FROM heatmap_rollup` + c.sql() + ` GROUP BY cx, cy`
 		args = append([]any{cols, cols, rows, rows}, c.args...)
 	} else {
@@ -983,11 +990,11 @@ func (s *Store) Heatmap(ctx context.Context, f Filter, cols, rows int) (Heatmap,
 		c := f.base(true)
 		c.add("type IN ("+placeholders(len(types))+")", toAny(types)...)
 		c.add("x IS NOT NULL AND x >= 0 AND y >= 0 AND doc_w > 0 AND doc_h > 0")
-		q = `SELECT MIN(CAST(x * ? / doc_w AS INTEGER), ? - 1) AS cx, MIN(CAST(y * ? / doc_h AS INTEGER), ? - 1) AS cy, COUNT(*)
+		q = `SELECT LEAST(trunc(x * ?::integer / doc_w)::integer, ?::integer - 1) AS cx, LEAST(trunc(y * ?::integer / doc_h)::integer, ?::integer - 1) AS cy, COUNT(*)
 			FROM events` + c.sql() + ` GROUP BY cx, cy`
 		args = append([]any{cols, cols, rows, rows}, c.args...)
 	}
-	rs, err := s.r.QueryContext(ctx, q, args...)
+	rs, err := s.query(ctx, q, args...)
 	if err != nil {
 		return h, err
 	}
@@ -1011,8 +1018,8 @@ func (s *Store) Heatmap(ctx context.Context, f Filter, cols, rows int) (Heatmap,
 	c := f.base(true)
 	c.add("type IN ("+placeholders(len(types))+")", toAny(types)...)
 	c.add("x IS NOT NULL")
-	err = s.r.QueryRowContext(ctx, `SELECT COUNT(DISTINCT session_id), CAST(COALESCE(AVG(doc_w), 0) AS INTEGER),
-		CAST(COALESCE(AVG(doc_h), 0) AS INTEGER), CAST(COALESCE(AVG(viewport_w), 0) AS INTEGER)
+	err = s.queryRow(ctx, `SELECT COUNT(DISTINCT session_id), COALESCE(trunc(AVG(doc_w)), 0)::integer,
+		COALESCE(trunc(AVG(doc_h)), 0)::integer, COALESCE(trunc(AVG(viewport_w)), 0)::integer
 		FROM events`+c.sql(), c.args...).Scan(&h.Visitors, &h.DocW, &h.DocH, &h.ViewportW)
 	return h, err
 }

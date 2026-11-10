@@ -3,15 +3,16 @@ package store
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
+
+	"calor/api/internal/store/pgtest"
 )
 
 var ctx = context.Background()
 
 func newTestStore(t *testing.T, sites ...string) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "test.db"), Options{})
+	s, err := Open(ctx, pgtest.DSN(t), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +392,7 @@ func TestDevicesAndSiteDelete(t *testing.T) {
 		t.Errorf("events should be deleted with the site: %+v", k)
 	}
 	var rollups int
-	if err := s.w.QueryRow(`SELECT COUNT(*) FROM heatmap_rollup WHERE site_id = 'a'`).Scan(&rollups); err != nil || rollups != 0 {
+	if err := s.w.QueryRow(ctx, `SELECT COUNT(*) FROM heatmap_rollup WHERE site_id = 'a'`).Scan(&rollups); err != nil || rollups != 0 {
 		t.Errorf("rollups left after delete: %d %v", rollups, err)
 	}
 	if err := s.DeleteSite(ctx, "a"); !errors.Is(err, ErrNotFound) {

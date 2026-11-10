@@ -1,18 +1,19 @@
-// Package store persists sites, events, screenshots and heatmap rollups in an
-// embedded, pure-Go SQLite database (modernc.org/sqlite, no CGO).
+// Package store persists sites, events, screenshots, components and heatmap
+// rollups in PostgreSQL through pgx v5 connection pools.
 package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"net/url"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Heatmap rollup resolution: clicks are pre-binned into a fixed grid of
@@ -22,219 +23,143 @@ const (
 	RollupRows = 800
 )
 
-// Options tune SQLite for small machines. Zero values pick conservative defaults.
+// Options size the connection pools. Zero values pick small defaults.
 type Options struct {
-	CacheKiB     int   // page cache per connection (default 4 MiB)
-	MmapBytes    int64 // 0 disables mmap: reads then go through the kernel page cache instead of counting toward RSS
-	MaxReadConns int
-	// SoftHeapBytes caps SQLite's own allocations process-wide (page caches,
-	// sorters); GOMEMLIMIT cannot see them. SQLite frees cache to stay under it.
-	SoftHeapBytes int64
+	// ReadConns bounds concurrent analytics queries (default 4).
+	ReadConns int32
+	// WriteConns serves the ingest writer, admin writes and retention
+	// (default 2, so a long retention delete never stalls ingest).
+	WriteConns int32
+	// MaxConnIdle closes pooled connections idle this long (default 5 min).
+	MaxConnIdle time.Duration
 }
 
 type Store struct {
-	w    *sql.DB // single writer connection
-	r    *sql.DB // small pool of read-only connections
-	path string
+	w     *pgxpool.Pool // ingest writer, admin writes, retention
+	r     *pgxpool.Pool // read-only analytics queries
+	parts partitions
 }
 
 var ErrNotFound = errors.New("not found")
 
-// Open opens (and migrates) the database at path. Use ":memory:" only for
-// throwaway use; tests use a temp file so reader and writer share data.
-func Open(path string, opt Options) (*Store, error) {
-	if opt.CacheKiB <= 0 {
-		opt.CacheKiB = 4 * 1024
+// Open connects to the database named by dsn (a postgres:// URL or a libpq
+// key=value string; empty uses the PG* environment variables), applies
+// pending migrations and makes sure this and next month's partitions exist.
+func Open(ctx context.Context, dsn string, opt Options) (*Store, error) {
+	if opt.ReadConns <= 0 {
+		opt.ReadConns = 4
 	}
-	if opt.MmapBytes < 0 {
-		opt.MmapBytes = 0
+	if opt.WriteConns <= 0 {
+		opt.WriteConns = 2
 	}
-	if opt.MaxReadConns <= 0 {
-		opt.MaxReadConns = 2
+	if opt.MaxConnIdle <= 0 {
+		opt.MaxConnIdle = 5 * time.Minute
 	}
-	if path != ":memory:" {
-		abs, err := filepath.Abs(path)
-		if err != nil {
-			return nil, err
-		}
-		path = abs
-	}
-	pragmas := []string{
-		"journal_mode(WAL)",
-		"synchronous(NORMAL)",
-		"busy_timeout(5000)",
-		"foreign_keys(ON)",
-		fmt.Sprintf("cache_size(-%d)", opt.CacheKiB),
-		fmt.Sprintf("mmap_size(%d)", opt.MmapBytes),
-		"journal_size_limit(67108864)",
-		"temp_store(FILE)",
-	}
-	if opt.SoftHeapBytes > 0 {
-		pragmas = append(pragmas, fmt.Sprintf("soft_heap_limit(%d)", opt.SoftHeapBytes))
-	}
-	dsn := "file:" + path + "?"
-	for i, p := range pragmas {
-		if i > 0 {
-			dsn += "&"
-		}
-		dsn += "_pragma=" + url.QueryEscape(p)
-	}
-	w, err := sql.Open("sqlite", dsn)
+	wcfg, err := poolConfig(dsn, opt.WriteConns, 1, opt.MaxConnIdle, nil)
 	if err != nil {
 		return nil, err
 	}
-	w.SetMaxOpenConns(1)
-	w.SetMaxIdleConns(1)
-	w.SetConnMaxIdleTime(0)
-
-	s := &Store{w: w, r: w, path: path}
-	if err := s.migrate(context.Background()); err != nil {
+	rcfg, err := poolConfig(dsn, opt.ReadConns, 0, opt.MaxConnIdle, map[string]string{"default_transaction_read_only": "on"})
+	if err != nil {
+		return nil, err
+	}
+	w, err := pgxpool.NewWithConfig(ctx, wcfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := w.Ping(ctx); err != nil {
 		w.Close()
 		return nil, err
 	}
-	if path != ":memory:" {
-		r, err := sql.Open("sqlite", dsn+"&_pragma="+url.QueryEscape("query_only(1)"))
-		if err != nil {
-			w.Close()
-			return nil, err
-		}
-		r.SetMaxOpenConns(opt.MaxReadConns)
-		r.SetMaxIdleConns(2)
-		r.SetConnMaxIdleTime(5 * time.Minute)
-		s.r = r
+	r, err := pgxpool.NewWithConfig(ctx, rcfg)
+	if err != nil {
+		w.Close()
+		return nil, err
+	}
+	s := &Store{w: w, r: r}
+	if err := s.migrate(ctx); err != nil {
+		s.Close()
+		return nil, err
+	}
+	if err := s.parts.load(ctx, w); err != nil {
+		s.Close()
+		return nil, err
+	}
+	if err := s.EnsureUpcomingPartitions(ctx, time.Now()); err != nil {
+		s.Close()
+		return nil, err
 	}
 	return s, nil
 }
 
+func poolConfig(dsn string, maxConns, minConns int32, idle time.Duration, params map[string]string) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("database url: %w", err)
+	}
+	cfg.MaxConns = maxConns
+	cfg.MinConns = minConns
+	cfg.MaxConnIdleTime = idle
+	rp := cfg.ConnConfig.RuntimeParams
+	if rp["application_name"] == "" {
+		rp["application_name"] = "calor-api"
+	}
+	for k, v := range params {
+		rp[k] = v
+	}
+	return cfg, nil
+}
+
 func (s *Store) Close() error {
-	var err error
-	if s.r != s.w {
-		err = s.r.Close()
-	}
-	if e := s.w.Close(); e != nil {
-		err = e
-	}
-	return err
-}
-
-// migrations[i] upgrades user_version i to i+1.
-var migrations = [][]string{schemaV1, schemaV2}
-
-var schemaV1 = []string{
-	`CREATE TABLE IF NOT EXISTS sites (
-		id TEXT PRIMARY KEY,
-		name TEXT NOT NULL,
-		domain TEXT NOT NULL,
-		created_at INTEGER NOT NULL
-	)`,
-	`CREATE TABLE IF NOT EXISTS events (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-		type TEXT NOT NULL,
-		page_url TEXT NOT NULL,
-		session_id TEXT NOT NULL,
-		pageview_id TEXT NOT NULL DEFAULT '',
-		ts INTEGER NOT NULL,
-		x REAL,
-		y REAL,
-		viewport_w INTEGER NOT NULL DEFAULT 0,
-		viewport_h INTEGER NOT NULL DEFAULT 0,
-		doc_w INTEGER NOT NULL DEFAULT 0,
-		doc_h INTEGER NOT NULL DEFAULT 0,
-		selector TEXT NOT NULL DEFAULT '',
-		el_tag TEXT NOT NULL DEFAULT '',
-		el_id TEXT NOT NULL DEFAULT '',
-		el_classes TEXT NOT NULL DEFAULT '',
-		el_text TEXT NOT NULL DEFAULT '',
-		el_label TEXT NOT NULL DEFAULT '',
-		rage INTEGER NOT NULL DEFAULT 0,
-		dead INTEGER NOT NULL DEFAULT 0,
-		target_url TEXT NOT NULL DEFAULT '',
-		nav_kind TEXT NOT NULL DEFAULT '',
-		referrer TEXT NOT NULL DEFAULT '',
-		redirect_count INTEGER NOT NULL DEFAULT 0,
-		scroll_depth REAL,
-		duration_ms INTEGER NOT NULL DEFAULT 0,
-		received_at INTEGER NOT NULL
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_events_site_type_ts ON events(site_id, type, ts)`,
-	`CREATE INDEX IF NOT EXISTS idx_events_site_page_type_ts ON events(site_id, page_url, type, ts)`,
-	`CREATE INDEX IF NOT EXISTS idx_events_site_session_ts ON events(site_id, session_id, ts)`,
-	`CREATE INDEX IF NOT EXISTS idx_events_pageview ON events(pageview_id)`,
-	`CREATE TABLE IF NOT EXISTS heatmap_rollup (
-		site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-		page_url TEXT NOT NULL,
-		type TEXT NOT NULL,
-		device TEXT NOT NULL,
-		hour INTEGER NOT NULL,
-		gx INTEGER NOT NULL,
-		gy INTEGER NOT NULL,
-		n INTEGER NOT NULL,
-		PRIMARY KEY (site_id, page_url, type, device, hour, gx, gy)
-	) WITHOUT ROWID`,
-	`CREATE TABLE IF NOT EXISTS screenshots (
-		site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-		page_url TEXT NOT NULL,
-		content_type TEXT NOT NULL,
-		data BLOB NOT NULL,
-		width INTEGER NOT NULL DEFAULT 0,
-		height INTEGER NOT NULL DEFAULT 0,
-		updated_at INTEGER NOT NULL,
-		PRIMARY KEY (site_id, page_url)
-	)`,
-}
-
-// Component tagging. event_components is keyed by component then time so a
-// component-scoped query reads one contiguous range; it has no foreign keys
-// so deletes can be chunked instead of cascading in one transaction.
-var schemaV2 = []string{
-	`ALTER TABLE events ADD COLUMN el_component TEXT NOT NULL DEFAULT ''`,
-	`CREATE TABLE IF NOT EXISTS components (
-		id TEXT PRIMARY KEY,
-		site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-		name TEXT NOT NULL,
-		selector TEXT NOT NULL DEFAULT '',
-		attr_name TEXT NOT NULL DEFAULT '',
-		attr_value TEXT NOT NULL DEFAULT '',
-		page_pattern TEXT NOT NULL DEFAULT '',
-		created_at INTEGER NOT NULL,
-		updated_at INTEGER NOT NULL
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_components_site ON components(site_id, name)`,
-	`CREATE TABLE IF NOT EXISTS event_components (
-		component_id TEXT NOT NULL,
-		ts INTEGER NOT NULL,
-		event_id INTEGER NOT NULL,
-		PRIMARY KEY (component_id, ts, event_id)
-	) WITHOUT ROWID`,
-}
-
-func (s *Store) migrate(ctx context.Context) error {
-	var v int
-	if err := s.w.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
-		return err
-	}
-	for ; v < len(migrations); v++ {
-		tx, err := s.w.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		for _, stmt := range migrations[v] {
-			if _, err := tx.ExecContext(ctx, stmt); err != nil {
-				tx.Rollback()
-				return fmt.Errorf("migrate to v%d: %w", v+1, err)
-			}
-		}
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", v+1)); err != nil {
-			tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
+	s.r.Close()
+	s.w.Close()
 	return nil
 }
+
+// Ping checks that the database answers.
+func (s *Store) Ping(ctx context.Context) error { return s.w.Ping(ctx) }
+
+// ---- SQL helpers ----
+
+// rebind turns ? placeholders into $1, $2, … so conditions can be composed
+// without tracking argument positions. Store SQL never contains a literal '?'.
+func rebind(q string) string {
+	if strings.IndexByte(q, '?') < 0 {
+		return q
+	}
+	var b strings.Builder
+	b.Grow(len(q) + 16)
+	n := 0
+	for i := 0; i < len(q); i++ {
+		if q[i] == '?' {
+			n++
+			b.WriteByte('$')
+			b.WriteString(strconv.Itoa(n))
+			continue
+		}
+		b.WriteByte(q[i])
+	}
+	return b.String()
+}
+
+func (s *Store) query(ctx context.Context, q string, args ...any) (pgx.Rows, error) {
+	return s.r.Query(ctx, rebind(q), args...)
+}
+
+func (s *Store) queryRow(ctx context.Context, q string, args ...any) pgx.Row {
+	return s.r.QueryRow(ctx, rebind(q), args...)
+}
+
+func (s *Store) exec(ctx context.Context, q string, args ...any) (pgconn.CommandTag, error) {
+	return s.w.Exec(ctx, rebind(q), args...)
+}
+
+func isUniqueViolation(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "23505"
+}
+
+// ---- classification helpers ----
 
 // DeviceOf classifies a viewport width.
 func DeviceOf(viewportW int) string {

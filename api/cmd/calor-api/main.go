@@ -31,6 +31,21 @@ func envInt(key string, def int) int {
 	return def
 }
 
+// openStore retries while the database is still starting (compose, boot).
+func openStore(dsn string, opts store.Options, wait time.Duration, logger *log.Logger) (*store.Store, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		st, err := store.Open(ctx, dsn, opts)
+		cancel()
+		if err == nil || time.Now().After(deadline) {
+			return st, err
+		}
+		logger.Printf("database not ready, retrying: %v", err)
+		time.Sleep(time.Second)
+	}
+}
+
 func main() {
 	logger := log.New(os.Stderr, "calor ", log.LstdFlags)
 
@@ -41,12 +56,17 @@ func main() {
 		debug.SetMemoryLimit(int64(envInt("CALOR_MEMORY_LIMIT_MB", 192)) << 20)
 	}
 
-	st, err := store.Open(env("CALOR_DB_PATH", "calor.db"), store.Options{
-		CacheKiB:      envInt("CALOR_SQLITE_CACHE_KB", 4096),
-		MmapBytes:     int64(envInt("CALOR_SQLITE_MMAP_MB", 0)) << 20,
-		MaxReadConns:  envInt("CALOR_DB_READERS", 2),
-		SoftHeapBytes: int64(envInt("CALOR_SQLITE_HEAP_MB", 64)) << 20,
-	})
+	for _, k := range []string{"CALOR_DB_PATH", "CALOR_SQLITE_HEAP_MB", "CALOR_SQLITE_CACHE_KB", "CALOR_SQLITE_MMAP_MB", "CALOR_DB_READERS"} {
+		if os.Getenv(k) != "" {
+			logger.Printf("WARNING: %s is no longer used (SQLite was replaced by PostgreSQL); see CALOR_DATABASE_URL and CALOR_DB_*_CONNS", k)
+		}
+	}
+	dsn := os.Getenv("CALOR_DATABASE_URL")
+	opts := store.Options{
+		ReadConns:  int32(envInt("CALOR_DB_READ_CONNS", 4)),
+		WriteConns: int32(envInt("CALOR_DB_WRITE_CONNS", 2)),
+	}
+	st, err := openStore(dsn, opts, time.Duration(envInt("CALOR_DB_CONNECT_TIMEOUT_SEC", 30))*time.Second, logger)
 	if err != nil {
 		logger.Fatalf("open store: %v", err)
 	}
@@ -69,25 +89,31 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if days := envInt("CALOR_RETENTION_DAYS", 0); days > 0 {
-		go func() {
-			t := time.NewTicker(time.Hour)
-			defer t.Stop()
-			for {
+	// Hourly maintenance: create next month's event partitions ahead of time
+	// and, with CALOR_RETENTION_DAYS, prune old raw events.
+	days := envInt("CALOR_RETENTION_DAYS", 0)
+	go func() {
+		t := time.NewTicker(time.Hour)
+		defer t.Stop()
+		for {
+			if err := st.EnsureUpcomingPartitions(ctx, time.Now()); err != nil && ctx.Err() == nil {
+				logger.Printf("partitions: %v", err)
+			}
+			if days > 0 {
 				cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour).UnixMilli()
-				if n, err := st.PruneEvents(ctx, cutoff); err != nil {
+				if n, err := st.PruneEvents(ctx, cutoff); err != nil && ctx.Err() == nil {
 					logger.Printf("retention: %v", err)
 				} else if n > 0 {
 					logger.Printf("retention: pruned %d events older than %d days", n, days)
 				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-t.C:
-				}
 			}
-		}()
-	}
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}()
 
 	addr := env("CALOR_ADDR", ":8080")
 	hs := &http.Server{
@@ -100,7 +126,7 @@ func main() {
 		MaxHeaderBytes:    32 << 10,
 	}
 	go func() {
-		logger.Printf("listening on %s (db %s)", addr, env("CALOR_DB_PATH", "calor.db"))
+		logger.Printf("listening on %s (postgres schema v%d)", addr, store.SchemaVersion())
 		if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatalf("listen: %v", err)
 		}

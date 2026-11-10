@@ -3,13 +3,14 @@ package store
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/base32"
 	"errors"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // DefaultComponentAttr is recorded by the tracker on every click (closest
@@ -149,7 +150,7 @@ func scanComponent(sc interface{ Scan(...any) error }) (Component, error) {
 }
 
 func (s *Store) ListComponents(ctx context.Context, siteID string) ([]Component, error) {
-	rows, err := s.r.QueryContext(ctx, `SELECT `+componentCols+` FROM components WHERE site_id = ? ORDER BY name, id`, siteID)
+	rows, err := s.query(ctx, `SELECT `+componentCols+` FROM components WHERE site_id = ? ORDER BY name, id`, siteID)
 	if err != nil {
 		return nil, err
 	}
@@ -166,8 +167,8 @@ func (s *Store) ListComponents(ctx context.Context, siteID string) ([]Component,
 }
 
 func (s *Store) GetComponent(ctx context.Context, siteID, id string) (Component, error) {
-	c, err := scanComponent(s.r.QueryRowContext(ctx, `SELECT `+componentCols+` FROM components WHERE site_id = ? AND id = ?`, siteID, id))
-	if errors.Is(err, sql.ErrNoRows) {
+	c, err := scanComponent(s.queryRow(ctx, `SELECT `+componentCols+` FROM components WHERE site_id = ? AND id = ?`, siteID, id))
+	if errors.Is(err, pgx.ErrNoRows) {
 		return Component{}, ErrNotFound
 	}
 	return c, err
@@ -175,7 +176,7 @@ func (s *Store) GetComponent(ctx context.Context, siteID, id string) (Component,
 
 func (s *Store) CountComponents(ctx context.Context, siteID string) (int, error) {
 	var n int
-	err := s.r.QueryRowContext(ctx, `SELECT COUNT(*) FROM components WHERE site_id = ?`, siteID).Scan(&n)
+	err := s.queryRow(ctx, `SELECT COUNT(*) FROM components WHERE site_id = ?`, siteID).Scan(&n)
 	return n, err
 }
 
@@ -185,9 +186,9 @@ func (s *Store) CreateComponent(ctx context.Context, c Component) (Component, er
 	}
 	c.CreatedAt = time.Now().UnixMilli()
 	c.UpdatedAt = c.CreatedAt
-	_, err := s.w.ExecContext(ctx, `INSERT INTO components (`+componentCols+`) VALUES (?,?,?,?,?,?,?,?,?)`,
+	_, err := s.exec(ctx, `INSERT INTO components (`+componentCols+`) VALUES (?,?,?,?,?,?,?,?,?)`,
 		c.ID, c.SiteID, c.Name, c.Selector, c.AttrName, c.AttrValue, c.PagePattern, c.CreatedAt, c.UpdatedAt)
-	if err != nil && (strings.Contains(err.Error(), "UNIQUE") || strings.Contains(err.Error(), "PRIMARY KEY")) {
+	if isUniqueViolation(err) {
 		return Component{}, ErrExists
 	}
 	return c, err
@@ -195,12 +196,12 @@ func (s *Store) CreateComponent(ctx context.Context, c Component) (Component, er
 
 func (s *Store) UpdateComponent(ctx context.Context, c Component) (Component, error) {
 	c.UpdatedAt = time.Now().UnixMilli()
-	res, err := s.w.ExecContext(ctx, `UPDATE components SET name = ?, selector = ?, attr_name = ?, attr_value = ?, page_pattern = ?, updated_at = ?
+	tag, err := s.exec(ctx, `UPDATE components SET name = ?, selector = ?, attr_name = ?, attr_value = ?, page_pattern = ?, updated_at = ?
 		WHERE site_id = ? AND id = ?`, c.Name, c.Selector, c.AttrName, c.AttrValue, c.PagePattern, c.UpdatedAt, c.SiteID, c.ID)
 	if err != nil {
 		return Component{}, err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if tag.RowsAffected() == 0 {
 		return Component{}, ErrNotFound
 	}
 	return c, nil
@@ -213,7 +214,7 @@ func (s *Store) DeleteComponent(ctx context.Context, siteID, id string) error {
 	if err := s.clearComponentTags(ctx, id); err != nil {
 		return err
 	}
-	_, err := s.w.ExecContext(ctx, `DELETE FROM components WHERE site_id = ? AND id = ?`, siteID, id)
+	_, err := s.exec(ctx, `DELETE FROM components WHERE site_id = ? AND id = ?`, siteID, id)
 	return err
 }
 
@@ -229,7 +230,7 @@ func (s *Store) allComponentIDs(ctx context.Context, siteID string) ([]string, e
 		q += ` WHERE site_id = ?`
 		args = append(args, siteID)
 	}
-	rows, err := s.w.QueryContext(ctx, q, args...)
+	rows, err := s.w.Query(ctx, rebind(q), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +252,7 @@ func clickKey(c *Click) string {
 }
 
 // backfillBatch bounds both the rows read per query and the tags written per
-// transaction, so retagging a large site never holds much memory or WAL.
+// transaction, so retagging a large site never holds much memory or locks.
 var backfillBatch = 5000
 
 // RetagComponent replaces the stored tags of m with the clicks recorded for
@@ -265,7 +266,7 @@ func (s *Store) RetagComponent(ctx context.Context, siteID string, m *ComponentM
 	memo := map[string]bool{}
 	var last, tagged int64
 	for {
-		rows, err := s.r.QueryContext(ctx, `SELECT id, ts, page_url, selector, el_tag, el_id, el_classes, el_component FROM events
+		rows, err := s.query(ctx, `SELECT id, ts, page_url, selector, el_tag, el_id, el_classes, el_component FROM events
 			WHERE site_id = ? AND type = 'click' AND id > ? ORDER BY id LIMIT ?`, siteID, last, backfillBatch)
 		if err != nil {
 			return tagged, err
@@ -312,23 +313,16 @@ func (s *Store) RetagComponent(ctx context.Context, siteID string, m *ComponentM
 
 type tagRow struct{ id, ts int64 }
 
+// insertTags writes one batch in one statement. Conflicts are expected: the
+// ingest writer may already have tagged a click that arrived during the retag.
 func (s *Store) insertTags(ctx context.Context, componentID string, rows []tagRow) error {
-	tx, err := s.w.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	ts, ids := make([]int64, len(rows)), make([]int64, len(rows))
+	for i, r := range rows {
+		ts[i], ids[i] = r.ts, r.id
 	}
-	defer tx.Rollback()
-	st, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO event_components (component_id, ts, event_id) VALUES (?,?,?)`)
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	for _, r := range rows {
-		if _, err := st.ExecContext(ctx, componentID, r.ts, r.id); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	_, err := s.w.Exec(ctx, `INSERT INTO event_components (component_id, ts, event_id)
+		SELECT $1, * FROM unnest($2::bigint[], $3::bigint[]) ON CONFLICT DO NOTHING`, componentID, ts, ids)
+	return err
 }
 
 // ---- preview ----
@@ -358,7 +352,7 @@ func (s *Store) PreviewComponent(ctx context.Context, f Filter, m *ComponentMatc
 	f.Component = ""
 	c := f.base(true)
 	c.add("type = 'click'")
-	rows, err := s.r.QueryContext(ctx, `SELECT page_url, selector, el_tag, el_id, el_classes, el_component,
+	rows, err := s.query(ctx, `SELECT page_url, selector, el_tag, el_id, el_classes, el_component,
 		MAX(el_text), MAX(el_label), COUNT(*)
 		FROM events`+c.sql()+` GROUP BY page_url, selector, el_tag, el_id, el_classes, el_component`, c.args...)
 	if err != nil {
@@ -433,8 +427,8 @@ func (s *Store) ComponentSummaries(ctx context.Context, f Filter) (map[string]Co
 	if f.PageURL != "" {
 		c.add("e.page_url = ?", f.PageURL)
 	}
-	rows, err := s.r.QueryContext(ctx, `SELECT ec.component_id, COUNT(*), COUNT(DISTINCT e.session_id), MAX(ec.ts)
-		FROM components c JOIN event_components ec ON ec.component_id = c.id JOIN events e ON e.id = ec.event_id`+
+	rows, err := s.query(ctx, `SELECT ec.component_id, COUNT(*), COUNT(DISTINCT e.session_id), MAX(ec.ts)
+		FROM components c JOIN event_components ec ON ec.component_id = c.id JOIN events e ON e.id = ec.event_id AND e.ts = ec.ts`+
 		c.sql()+` GROUP BY ec.component_id`, c.args...)
 	if err != nil {
 		return nil, err
@@ -476,7 +470,7 @@ func (s *Store) ComponentStats(ctx context.Context, f Filter, m *ComponentMatche
 	scoped := f
 	c := scoped.base(true)
 	c.add("type = 'click'")
-	if err := s.r.QueryRowContext(ctx, `SELECT COUNT(*), COUNT(DISTINCT session_id), COALESCE(SUM(rage), 0), COALESCE(SUM(dead), 0),
+	if err := s.queryRow(ctx, `SELECT COUNT(*), COUNT(DISTINCT session_id), COUNT(*) FILTER (WHERE rage), COUNT(*) FILTER (WHERE dead),
 		COUNT(DISTINCT pageview_id), COALESCE(MIN(ts), 0), COALESCE(MAX(ts), 0) FROM events`+c.sql(), c.args...).
 		Scan(&st.Clicks, &st.Visitors, &st.RageClicks, &st.DeadClicks, &st.ClickedViews, &st.FirstSeen, &st.LastSeen); err != nil {
 		return st, err
@@ -485,14 +479,14 @@ func (s *Store) ComponentStats(ctx context.Context, f Filter, m *ComponentMatche
 	all.Component = ""
 	c = all.base(true)
 	c.add("type = 'click'")
-	if err := s.r.QueryRowContext(ctx, `SELECT COUNT(*) FROM events`+c.sql(), c.args...).Scan(&st.SiteClicks); err != nil {
+	if err := s.queryRow(ctx, `SELECT COUNT(*) FROM events`+c.sql(), c.args...).Scan(&st.SiteClicks); err != nil {
 		return st, err
 	}
 	st.ClickShare = ratio(st.Clicks, st.SiteClicks)
 
 	c = scoped.base(true)
 	c.add("type = 'click'")
-	rows, err := s.r.QueryContext(ctx, `SELECT page_url, COUNT(*) FROM events`+c.sql()+` GROUP BY page_url ORDER BY 2 DESC, 1`, c.args...)
+	rows, err := s.query(ctx, `SELECT page_url, COUNT(*) FROM events`+c.sql()+` GROUP BY page_url ORDER BY 2 DESC, 1`, c.args...)
 	if err != nil {
 		return st, err
 	}
@@ -517,7 +511,7 @@ func (s *Store) ComponentStats(ctx context.Context, f Filter, m *ComponentMatche
 
 	c = all.base(true)
 	c.add("type = 'pageview'")
-	rows, err = s.r.QueryContext(ctx, `SELECT page_url, COUNT(*) FROM events`+c.sql()+` GROUP BY page_url`, c.args...)
+	rows, err = s.query(ctx, `SELECT page_url, COUNT(*) FROM events`+c.sql()+` GROUP BY page_url`, c.args...)
 	if err != nil {
 		return st, err
 	}
@@ -553,7 +547,7 @@ func (s *Store) DiscoveredAttributes(ctx context.Context, f Filter, limit int) (
 	c := f.base(true)
 	c.add("type = 'click'")
 	c.add("el_component <> ''")
-	rows, err := s.r.QueryContext(ctx, `SELECT el_component, COUNT(*), COUNT(DISTINCT page_url) FROM events`+c.sql()+
+	rows, err := s.query(ctx, `SELECT el_component, COUNT(*), COUNT(DISTINCT page_url) FROM events`+c.sql()+
 		` GROUP BY el_component ORDER BY 2 DESC, 1 LIMIT `+strconv.Itoa(limit), c.args...)
 	if err != nil {
 		return nil, err

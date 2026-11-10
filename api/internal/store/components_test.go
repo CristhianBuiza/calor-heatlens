@@ -1,8 +1,6 @@
 package store
 
 import (
-	"database/sql"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -226,7 +224,7 @@ func TestRetagFilterPreviewAndStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	var left int
-	s.r.QueryRowContext(ctx, `SELECT COUNT(*) FROM event_components`).Scan(&left)
+	s.r.QueryRow(ctx, `SELECT COUNT(*) FROM event_components`).Scan(&left)
 	if left != 0 {
 		t.Errorf("%d tags left after delete", left)
 	}
@@ -245,37 +243,8 @@ func TestInsertEventsWritesTags(t *testing.T) {
 		t.Fatal(err)
 	}
 	var n int
-	s.r.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM event_components) + (SELECT COUNT(*) FROM components)`).Scan(&n)
+	s.r.QueryRow(ctx, `SELECT (SELECT COUNT(*) FROM event_components) + (SELECT COUNT(*) FROM components)`).Scan(&n)
 	if n != 0 {
 		t.Errorf("%d component rows left after site delete", n)
-	}
-}
-
-func TestMigrateFromV1(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "v1.db")
-	db, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, stmt := range schemaV1 {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatal(err)
-		}
-	}
-	db.Exec(`PRAGMA user_version = 1`)
-	db.Exec(`INSERT INTO sites VALUES ('a','a','a.test',0)`)
-	db.Exec(`INSERT INTO events (site_id, type, page_url, session_id, ts, received_at) VALUES ('a','click','https://a.test/','s',1,1)`)
-	db.Close()
-
-	s, err := Open(path, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	var v int
-	var comp string
-	s.r.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v)
-	if err := s.r.QueryRowContext(ctx, `SELECT el_component FROM events`).Scan(&comp); err != nil || v != len(migrations) {
-		t.Fatalf("after migrate: version %d, el_component %q, %v", v, comp, err)
 	}
 }
