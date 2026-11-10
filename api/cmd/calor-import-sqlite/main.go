@@ -130,13 +130,15 @@ func run(ctx context.Context, srcPath, dsn string, logger *log.Logger) error {
 	if _, err := tx.Exec(ctx, `SELECT setval(pg_get_serial_sequence('events', 'id'), COALESCE((SELECT MAX(id) FROM events), 0) + 1, false)`); err != nil {
 		return err
 	}
+	// Verified before commit: a mismatch rolls the whole import back.
+	if err := verify(ctx, src, tx, tables, version, copied, logger); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	if _, err := conn.Exec(ctx, `ANALYZE sites, components, events, event_components, heatmap_rollup, screenshots`); err != nil {
-		return err
-	}
-	return verify(ctx, src, conn, tables, version, copied, logger)
+	_, err = conn.Exec(ctx, `ANALYZE sites, components, events, event_components, heatmap_rollup, screenshots`)
+	return err
 }
 
 // createPartitions makes the monthly partitions every imported event needs.
@@ -218,7 +220,7 @@ func nullable(f sql.NullFloat64) *float64 {
 }
 
 // verify compares row counts and a few aggregates between source and target.
-func verify(ctx context.Context, src *sql.DB, conn *pgx.Conn, tables []table, version int, copied map[string]int64, logger *log.Logger) error {
+func verify(ctx context.Context, src *sql.DB, dst pgx.Tx, tables []table, version int, copied map[string]int64, logger *log.Logger) error {
 	ok := true
 	for _, t := range tables {
 		if t.needV2 && version < 2 {
@@ -228,7 +230,7 @@ func verify(ctx context.Context, src *sql.DB, conn *pgx.Conn, tables []table, ve
 		if err := src.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+t.name).Scan(&a); err != nil {
 			return err
 		}
-		if err := conn.QueryRow(ctx, `SELECT COUNT(*) FROM `+t.name).Scan(&b); err != nil {
+		if err := dst.QueryRow(ctx, `SELECT COUNT(*) FROM `+t.name).Scan(&b); err != nil {
 			return err
 		}
 		if a != b || copied[t.name] != a {
@@ -238,14 +240,14 @@ func verify(ctx context.Context, src *sql.DB, conn *pgx.Conn, tables []table, ve
 	}
 	checks := []string{
 		`SELECT COALESCE(SUM(id), 0) FROM events`,
-		`SELECT COALESCE(SUM(ts), 0) FROM events`,
+		`SELECT COALESCE(SUM(ts / 1000), 0) FROM events`, // seconds: ms would overflow int64 at ~5M events
 		`SELECT COUNT(*) FROM events WHERE rage <> 0`,
 		`SELECT COALESCE(SUM(n), 0) FROM heatmap_rollup`,
 		`SELECT COALESCE(SUM(LENGTH(data)), 0) FROM screenshots`,
 	}
 	pgChecks := []string{
 		`SELECT COALESCE(SUM(id), 0)::bigint FROM events`,
-		`SELECT COALESCE(SUM(ts), 0)::bigint FROM events`,
+		`SELECT COALESCE(SUM(ts / 1000), 0)::bigint FROM events`,
 		`SELECT COUNT(*) FROM events WHERE rage`,
 		`SELECT COALESCE(SUM(n), 0)::bigint FROM heatmap_rollup`,
 		`SELECT COALESCE(SUM(length(data)), 0)::bigint FROM screenshots`,
@@ -255,7 +257,7 @@ func verify(ctx context.Context, src *sql.DB, conn *pgx.Conn, tables []table, ve
 		if err := src.QueryRowContext(ctx, checks[i]).Scan(&a); err != nil {
 			return err
 		}
-		if err := conn.QueryRow(ctx, pgChecks[i]).Scan(&b); err != nil {
+		if err := dst.QueryRow(ctx, pgChecks[i]).Scan(&b); err != nil {
 			return err
 		}
 		if a != b {

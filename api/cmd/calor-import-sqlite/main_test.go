@@ -148,3 +148,29 @@ func TestImportV1(t *testing.T) {
 		t.Errorf("v1 import: %+v", k)
 	}
 }
+
+func TestFailedImportLeavesTargetEmpty(t *testing.T) {
+	dsn := pgtest.DSN(t)
+	src := sqliteDB(t, 2)
+	db, err := sql.Open("sqlite", "file:"+src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// SQLite doesn't enforce foreign keys unless asked; PostgreSQL does.
+	if _, err := db.Exec(`INSERT INTO events (site_id, type, page_url, session_id, ts, received_at) VALUES ('gone', 'pageview', 'https://x.test/', 's', ` + itoa(jan) + `, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	ctx := context.Background()
+	if err := run(ctx, src, dsn, log.New(io.Discard, "", 0)); err == nil {
+		t.Fatal("import of an orphaned event should fail")
+	}
+	st, err := store.Open(ctx, dsn, store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if sites, _ := st.ListSites(ctx); len(sites) != 0 {
+		t.Errorf("failed import left %d sites behind", len(sites))
+	}
+}

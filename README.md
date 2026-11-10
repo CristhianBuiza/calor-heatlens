@@ -2,18 +2,20 @@
 
 Calor is a self-hosted, privacy-friendly heatmap and click analytics tool for one or
 many websites. A 3 KB tracker records clicks, navigations and scroll depth. A single Go
-binary stores them in SQLite. A Next.js dashboard shows click heatmaps over page
+binary stores them in PostgreSQL. A Next.js dashboard shows click heatmaps over page
 screenshots, most-clicked elements, time-of-day patterns, scroll reach, entry and exit
 pages, and side-by-side site comparisons. Components (named page regions defined by a CSS
 selector or a `data-calor-component` attribute) scope heatmaps and click stats to one
 part of a page.
 
-It is built to run on a small VPS: in measured runs the whole stack stays under
-~300 MiB of RAM.
+It is built to run on a small VPS (the target is 4 GB of RAM): in measured runs the API,
+the dashboard and PostgreSQL together use about 350 MiB while browsing and peak at about
+640 MiB under the load test.
 
 - No cookies: the session ID lives in `sessionStorage`, and query strings are stripped
   from URLs.
-- No CGO, no external database, no chart libraries.
+- No CGO and no chart libraries. One PostgreSQL (16 or newer) database is the only other
+  service.
 - Multi-site from the ground up: sites have generated IDs, every query is scoped by site,
   and ingest checks that the request comes from the site's domain.
 
@@ -30,6 +32,7 @@ It is built to run on a small VPS: in measured runs the whole stack stays under
 - [API summary](#api-summary)
 - [Resource usage (measured)](#resource-usage-measured)
 - [Deployment](#deployment)
+- [Upgrading from SQLite](#upgrading-from-sqlite)
 - [Setup caveats and known limits](#setup-caveats-and-known-limits)
 - More detail: [`docs/architecture.md`](docs/architecture.md) and
   [`docs/api.md`](docs/api.md) (full API reference, wire format, measured traffic)
@@ -37,13 +40,15 @@ It is built to run on a small VPS: in measured runs the whole stack stays under
 ## Architecture
 
 ```
-  tracked website                     calor-api  (Go, static binary)              SQLite file (WAL)
+  tracked website                     calor-api  (Go, static binary)              PostgreSQL 16
  ┌──────────────────┐  sendBeacon    ┌──────────────────────────────────────┐    ┌────────────────┐
  │ calor.min.js     │ ─────────────▶ │ POST /api/events  (public, CORS *)   │    │ sites          │
- │ clicks · navs ·  │  batched JSON  │  validate → bounded queue → 1 writer │ ─▶ │ events         │
- │ scroll · SPA     │  (text/plain)  │                                      │    │ heatmap_rollup │
- └──────────────────┘                │ GET /api/sites/{site}/…  (admin key) │ ◀─ │ screenshots    │
-                                     │  2 readers · response cache · gzip   │    └────────────────┘
+ │ clicks · navs ·  │  batched JSON  │  validate → bounded queue → 1 writer │ ─▶ │ events (by     │
+ │ scroll · SPA     │  (text/plain)  │                                      │    │  month)        │
+ └──────────────────┘                │ GET /api/sites/{site}/…  (admin key) │ ◀─ │ heatmap_rollup │
+                                     │  read pool · response cache · gzip   │    │ screenshots    │
+                                     │                                      │    │ components     │
+                                     │                                      │    └────────────────┘
   dashboard (Next.js standalone)     └──────────────────────────────────────┘
  ┌──────────────────┐   HTTP + admin key        ▲
  │ server components│ ──────────────────────────┘
@@ -54,19 +59,19 @@ It is built to run on a small VPS: in measured runs the whole stack stays under
 
 | Directory | What it is |
 |---|---|
-| `api/` | Go 1.22 module. `cmd/calor-api` is the server, `cmd/calor-loadtest` a load generator. `internal/store` holds the SQLite schema, migrations and aggregations; `internal/server` holds HTTP, ingest, auth and cache. Pure-Go SQLite ([modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)) is the only dependency |
+| `api/` | Go 1.22 module. `cmd/calor-api` is the server, `cmd/calor-loadtest` a load generator, `cmd/calor-import-sqlite` a one-shot importer for databases from the SQLite era. `internal/store` holds the PostgreSQL schema (embedded SQL migrations), partition management and aggregations; `internal/server` holds HTTP, ingest, auth and cache. [pgx](https://pkg.go.dev/github.com/jackc/pgx/v5) is the server's only dependency; the importer also uses pure-Go SQLite ([modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)) |
 | `tracker/` | `src/calor.js`, the tracker, which has no dependencies. `build.mjs` (esbuild) produces `dist/calor.min.js`. `demo/` is a zero-dependency server for three demo sites |
 | `dashboard/` | Next.js 16 / React 19 App Router, `output: 'standalone'`. Runtime dependencies: `next`, `react`, `react-dom`, `server-only` |
 | `e2e/` | puppeteer-core scripts: realistic seed data (including demo components), live browser test with wire-level traffic capture, the component tagging UI test, resource measurement, screenshots |
-| `deploy/` | systemd units and Dockerfiles. `docker-compose.yml` is at the root |
+| `deploy/` | systemd units, Dockerfiles and `postgres/postgresql.conf` (small-VPS tuning). `docker-compose.yml` is at the root |
 | `docs/` | architecture and API reference |
 
 Data flow:
 
 1. The tracker batches events and sends them with `sendBeacon`.
 2. The API checks the site and origin, then queues the batch.
-3. A single writer stores each batch in one transaction and updates an hourly heatmap
-   rollup.
+3. A single writer stores each batch in one transaction (`COPY`) and updates an hourly
+   heatmap rollup.
 4. The dashboard server queries the read endpoints with the admin key and renders
    everything server-side, except the canvas heatmap.
 
@@ -74,12 +79,13 @@ Details are in [`docs/architecture.md`](docs/architecture.md).
 
 ## Quick start
 
-Requirements: **Go ≥ 1.22**, **Node ≥ 20.9** (Next.js 16), GNU make, and Chrome or
-Chromium for the seed, e2e and screenshot scripts.
+Requirements: **Go ≥ 1.22**, **Node ≥ 20.9** (Next.js 16), **PostgreSQL ≥ 16** (or Docker
+for `make db`), GNU make, and Chrome or Chromium for the seed, e2e and screenshot scripts.
 
 ```bash
 git clone https://github.com/CristhianBuiza/calor-heatlens.git calor && cd calor
 make deps        # go mod download + npm ci in tracker/, dashboard/, e2e/
+make db          # PostgreSQL 16 in Docker on 127.0.0.1:5432 (user/password calor, databases calor + calor_test)
 make build       # bin/calor-api, tracker/dist/calor.min.js, dashboard standalone build
 make start       # API :8080 + dashboard :3000 + demo sites :5500 (Ctrl-C stops all)
 
@@ -93,22 +99,37 @@ The demo sites run on `http://acme.localhost:5500` (shop), `http://nimbus.localh
 `*.localhost` to loopback, so clicking around produces real events. They appear after a
 few seconds; analytics responses are cached for 15 s.
 
+To use an existing PostgreSQL server instead of `make db`, create a role and two databases
+and point the Makefile at them:
+
+```bash
+sudo -u postgres createuser -P calor            # password: calor, or set your own below
+sudo -u postgres createdb -O calor calor && sudo -u postgres createdb -O calor calor_test
+make start DATABASE_URL='postgres://calor:secret@127.0.0.1:5432/calor?sslmode=disable'
+```
+
+The API creates and migrates its schema on start. `make test` uses `calor_test` (each test
+works in a throwaway schema it drops afterwards).
+
 | Target | |
 |---|---|
 | `make dev` | the same three processes in development mode (`go run`, `next dev`) |
-| `make test` | `go vet` + Go tests |
+| `make test` | `go vet` + Go tests against `TEST_DATABASE_URL`. With `TEST_DATABASE_URL=` the database tests are skipped |
+| `make db` / `make db-stop` | start or stop a local PostgreSQL 16 in Docker (data kept in the `calor-dev-pg` volume) |
+| `make db-reset` | drop every Calor table in `DATABASE_URL` (needs `psql`); the API recreates the schema on start |
+| `make import-sqlite SQLITE=data/calor.db` | copy a database from the SQLite era into `DATABASE_URL` (see [Upgrading from SQLite](#upgrading-from-sqlite)) |
 | `make e2e` | real Chrome sessions on the demo sites, capturing every tracker request. Writes `e2e/output/traffic.json`. When the sites have components (after `make seed`) it also checks that live clicks are tagged |
 | `make e2e-tagging` | drives the Components pages in Chrome: element picker, live match preview, create, the component filter on page detail, the per-component report, attribute registration and validation errors. Needs `make seed`; cleans up what it creates |
 | `make measure` | tracker size, dashboard JS per route, and API and dashboard RSS. Writes `e2e/output/measure.json` |
-| `make loadtest` | 30 s of ingest plus queries against a running API, with RSS sampling |
+| `make loadtest` | 30 s of ingest plus uncached queries against a running API, sampling the API's RSS and the local PostgreSQL's memory |
 | `make screenshots` | dashboard screenshots into `e2e/output/` (or `SHOTS_DIR`) |
-| `make clean` | removes build output and the local database |
+| `make clean` | removes build output. The data lives in PostgreSQL: use `make db-reset` |
 
 ## Running each piece
 
 ```bash
 # API
-cd api && CALOR_ADMIN_KEY=change-me CALOR_DB_PATH=../data/calor.db \
+cd api && CALOR_ADMIN_KEY=change-me CALOR_DATABASE_URL='postgres://calor:calor@127.0.0.1:5432/calor' \
   CALOR_TRACKER_DIR=../tracker/dist go run ./cmd/calor-api
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../bin/calor-api ./cmd/calor-api
 
@@ -129,19 +150,24 @@ npm run build && npm start                  # standalone, node --max-old-space-s
 | Variable | Default | Meaning |
 |---|---|---|
 | `CALOR_ADDR` | `:8080` | listen address |
-| `CALOR_DB_PATH` | `calor.db` | SQLite file (WAL mode) |
+| `CALOR_DATABASE_URL` | *(empty)* | PostgreSQL connection string, URL (`postgres://user:pass@host:5432/calor?sslmode=disable`) or key/value (`host=/run/postgresql dbname=calor`). Empty means the standard libpq `PG*` variables and defaults (`PGHOST`, `PGUSER`, `PGPASSWORD`, …), which also fill in anything the string leaves out |
+| `CALOR_DB_READ_CONNS` | `4` | read pool size (every analytics query). Sessions are read-only |
+| `CALOR_DB_WRITE_CONNS` | `2` | write pool size: the ingest writer plus site/component changes, retagging and retention |
+| `CALOR_DB_CONNECT_TIMEOUT_SEC` | `30` | how long startup keeps retrying while the database isn't reachable yet |
 | `CALOR_ADMIN_KEY` | *(empty)* | key for every read and admin endpoint (`Authorization: Bearer …` or `X-API-Key`). **Empty means unauthenticated.** The Makefile uses `dev-admin-key` for local runs; change it anywhere else |
 | `CALOR_TRACKER_DIR` | *(unset)* | if set, serves the tracker at `/tracker/calor.min.js` |
 | `CALOR_STRICT_ORIGIN` | `true` | reject ingest whose `Origin`, or page URL host, isn't the site's domain or a subdomain |
 | `CALOR_MAX_BODY_KB` / `CALOR_MAX_BATCH` | `256` / `200` | ingest limits (413 above them) |
 | `CALOR_QUEUE_SIZE` | `2048` | ingest queue length in requests. When it is full, ingest returns 503 with `Retry-After` |
 | `CALOR_CACHE_TTL_SEC` | `15` | analytics response cache TTL |
-| `CALOR_RETENTION_DAYS` | `0` (keep all) | prune raw events older than N days, hourly. Heatmap rollups are kept |
+| `CALOR_RETENTION_DAYS` | `0` (keep all) | prune raw events older than N days, hourly: whole month partitions are dropped, the boundary month is deleted in chunks. Heatmap rollups are kept |
 | `GOMEMLIMIT` / `CALOR_MEMORY_LIMIT_MB` | unset / `192` | Go soft memory limit. The second applies when the first is unset |
-| `CALOR_SQLITE_HEAP_MB` | `64` | SQLite `soft_heap_limit`, process-wide. `GOMEMLIMIT` can't see SQLite's memory |
-| `CALOR_SQLITE_CACHE_KB` | `4096` | page cache per connection |
-| `CALOR_DB_READERS` | `2` | read-only connections |
-| `CALOR_SQLITE_MMAP_MB` | `0` | memory-mapped I/O; off so file pages don't count toward RSS |
+
+`CALOR_DB_PATH`, `CALOR_SQLITE_HEAP_MB`, `CALOR_SQLITE_CACHE_KB`, `CALOR_SQLITE_MMAP_MB` and
+`CALOR_DB_READERS` are gone; the API logs a warning when one is still set. Their
+PostgreSQL counterparts are `CALOR_DATABASE_URL`, `CALOR_DB_READ_CONNS`, and the server's own
+memory settings (`shared_buffers`, `work_mem`) in
+[`deploy/postgres/postgresql.conf`](deploy/postgres/postgresql.conf).
 
 ### Dashboard
 
@@ -347,40 +373,74 @@ reference, with parameters, status codes and the wire format, is in
 
 ## Resource usage (measured)
 
-Measured with 155k seeded events (3 sites, 30 days, a 79 MB database), with the API, the
-dashboard and the demo server on one machine:
+Measured with 153k seeded events (3 sites, 30 days; 122 MB in PostgreSQL including
+indexes), with the API, the dashboard, the demo server and PostgreSQL 16 (tuned by
+[`deploy/postgres/postgresql.conf`](deploy/postgres/postgresql.conf)) on one 8-core machine.
+PostgreSQL memory is the summed PSS of its processes, which counts the shared buffers once:
 
 | | |
 |---|---|
-| API RSS, idle | **8.7 MiB** |
-| API RSS, after browsing every dashboard route 3 times | 69 MiB (peak 80 MiB) |
-| API RSS, 30 s load test (16 ingest + 4 query workers) | peak **147.5 MiB** |
-| Load-test throughput | 9,054 events/s accepted, 0 errors (503 backpressure when the queue fills); queries p50 0.6 ms, p95 43 ms |
-| Ingest only | ~15k events/s |
-| Dashboard RSS, idle / after browsing | **81 MiB** / 127 MiB (peak 133 MiB) |
+| API RSS, idle | **11 MiB** |
+| API RSS, after browsing every dashboard route 3 times | 17 MiB (peak 20 MiB) |
+| PostgreSQL, idle / after browsing | 110 MiB / 177 MiB |
+| 30 s load test (16 ingest + 4 query workers) | API peak **111 MiB**, PostgreSQL peak 378 MiB |
+| Load-test throughput | **33,755 events/s** accepted, 0 errors (503 backpressure when the queue fills); 35.8 uncached queries/s, p50 12 ms, p95 611 ms |
+| Ingest only | ~34k events/s |
+| Dashboard RSS, idle / after browsing | 109 MiB / 132 MiB (peak 148 MiB) |
 | Tracker | 6,208 B minified, **3,011 B gzip** |
 | Dashboard first-load JS per route | 137–141 KiB gzip. The heatmap chunk (+2.6 KiB) loads only on page detail |
 | Binaries | `calor-api` 9.6 MB static; standalone dashboard 64 MB on disk |
 
+Load-test queries are uncached aggregations over the load-test site, which grows by about
+a million events during the run, so their latency mostly reflects how big the site has
+become. On a fixed volume (270k events preloaded, then 30 s) the numbers compare directly with
+the SQLite build this replaced, on the same machine:
+
+| 270k-event site, 4 query workers | SQLite (before) | PostgreSQL |
+|---|---|---|
+| queries only | 3.2 queries/s, p95 3.1 s | **19.4 queries/s**, p95 0.93 s |
+| queries + ingest capped at 9,000 events/s | 1.6 queries/s, p95 5.8 s; ingest fell to 7,953/s | **13.8 queries/s**, p95 1.29 s; ingest held 8,979/s |
+| API RSS peak | 160 MiB | **51 MiB** (+ PostgreSQL 362 MiB) |
+
+The SQLite build's own numbers with the default load test were 9,062 events/s and an API peak of
+154 MiB (~19k events/s ingest only). The 705 dashboard API responses compared between the two
+builds on the same data are byte-identical; a sequential pass over them took 12 s on
+PostgreSQL and 42 s on SQLite, which also timed out (> 60 s) on 12 entry/exit and flow
+requests filtered by device. Details: [`docs/architecture.md`](docs/architecture.md).
+
 How memory stays bounded:
 
-- Go's soft memory limit (`GOMEMLIMIT`), plus a separate cap on SQLite's own memory
-  (`soft_heap_limit`), small page caches, two readers, and mmap off.
+- Go's soft memory limit (`GOMEMLIMIT`). The database's memory is no longer inside the API
+  process: PostgreSQL is capped by its own settings (256 MB `shared_buffers`, 8 MB
+  `work_mem`, 20 connections) and, in Docker, a 1 GiB `mem_limit`.
+- Small connection pools: 4 read and 2 write connections.
 - A bounded ingest queue that returns 503 instead of buffering.
 - A capped response cache.
 - An hourly rollup, so heatmaps don't scan raw clicks.
 - A V8 heap cap on the dashboard.
 
-Reproduce the numbers with `make measure` and `make loadtest`.
+Reproduce the numbers with `make measure` and `make loadtest` (run the load test with `sudo`
+to read PostgreSQL's PSS; otherwise its RSS is summed, counting shared memory once per
+process). The fixed-volume runs use `calor-loadtest -rate 9000 -query 0 -keep`, then
+`-reuse -ingest 0` and `-reuse -rate 9000`.
 
 ## Deployment
 
 ### systemd
 
 Units are in `deploy/systemd/`. They set `MemoryHigh=256M` / `MemoryMax=320M` and
-filesystem hardening, and their syntax checks with `systemd-analyze verify`.
+filesystem hardening, and their syntax checks with `systemd-analyze verify`. The API unit
+starts after `postgresql.service` and connects over the local Unix socket with peer
+authentication: the `calor` OS user maps to the `calor` database role, so no password is
+stored anywhere.
 
 ```bash
+# PostgreSQL 16 from the distribution (Debian 13 / Ubuntu 24.04) or apt.postgresql.org
+sudo apt install postgresql-16
+sudo cp deploy/postgres/postgresql.conf /etc/postgresql/16/main/conf.d/calor.conf
+sudo systemctl restart postgresql
+sudo -u postgres createuser calor && sudo -u postgres createdb -O calor calor
+
 sudo useradd --system --home /opt/calor calor
 sudo mkdir -p /opt/calor/bin /opt/calor/tracker /opt/calor/dashboard/.next /etc/calor
 sudo cp bin/calor-api /opt/calor/bin/
@@ -390,6 +450,10 @@ echo 'CALOR_ADMIN_KEY=<a long random value>' | sudo tee /etc/calor/calor.env && 
 sudo cp deploy/systemd/*.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now calor-api calor-dashboard
 ```
+
+The tuned config listens on localhost only (`listen_addresses` is not set in it) and takes
+about 300 MiB with the API connected. Back up with `pg_dump -Fc calor` (or any
+PostgreSQL backup tool); the API needs no downtime for it.
 
 Put a TLS reverse proxy (Caddy or nginx) in front:
 
@@ -401,21 +465,56 @@ Put a TLS reverse proxy (Caddy or nginx) in front:
 ### Docker Compose
 
 ```bash
-CALOR_ADMIN_KEY=<a long random value> CALOR_PUBLIC_API_URL=https://calor.example.com \
-  docker compose up -d --build
+POSTGRES_PASSWORD=$(openssl rand -hex 24) CALOR_ADMIN_KEY=<a long random value> \
+  CALOR_PUBLIC_API_URL=https://calor.example.com docker compose up -d --build
 ```
 
-Each service has `mem_limit: 320m`, and data lives in the `calor-data` volume. The
-Dockerfiles mirror the tested `make start` setup. **They have not yet been run**, because
-Docker wasn't available in the environment where this was built.
+- `postgres` runs `postgres:16.15-alpine3.24` with the tuned
+  `deploy/postgres/postgresql.conf`, `mem_limit: 1g`, a 128 MB `/dev/shm`, and its data in
+  the `calor-pg` volume. Its port is not published.
+- `api` waits for the database's health check (`pg_isready` over TCP) and retries its
+  connection for 30 s besides. The API and the dashboard keep `mem_limit: 320m`.
+- Keep `POSTGRES_PASSWORD` stable: the image only uses it when it initializes an empty
+  volume.
+
+The Dockerfiles mirror the tested `make start` setup. **They have not yet been run**, because
+Docker wasn't available in the environment where this was built; the same PostgreSQL
+version and config were tested from the distribution packages.
 
 ### Tuning
 
 | Goal | Change |
 |---|---|
-| less memory | lower `GOMEMLIMIT` and `CALOR_SQLITE_HEAP_MB`, set `CALOR_DB_READERS=1`, lower `CALOR_QUEUE_SIZE`, use `--max-old-space-size=128` |
-| faster heavy queries on big sites | raise `CALOR_SQLITE_CACHE_KB` and `CALOR_DB_READERS` |
-| bounded disk use | `CALOR_RETENTION_DAYS` |
+| less memory | lower `shared_buffers` (128MB still works for small sites) and `GOMEMLIMIT`, set `CALOR_DB_READ_CONNS=2`, lower `CALOR_QUEUE_SIZE`, use `--max-old-space-size=128` |
+| faster heavy queries on big sites | raise `shared_buffers` (up to ~25% of RAM) and `effective_cache_size`, `work_mem` to 16–32MB, `CALOR_DB_READ_CONNS` up to the number of cores (keep `max_connections` above the two pools combined) |
+| more ingest | `CALOR_DB_WRITE_CONNS` doesn't matter much (one writer); a faster disk and `max_wal_size` do |
+| bounded disk use | `CALOR_RETENTION_DAYS`: whole months are dropped as partitions, so space is returned to the OS at once |
+
+## Upgrading from SQLite
+
+Versions before the PostgreSQL migration kept everything in one SQLite file
+(`CALOR_DB_PATH`, default `calor.db`). `calor-import-sqlite` copies such a file (schema
+version 1 or 2) into an empty PostgreSQL database in one transaction, keeping event ids,
+and then compares row counts and checksums (sums of ids and timestamps, rage flags, rollup
+totals, screenshot bytes) between the two:
+
+```bash
+# 1. stop the old API so the file doesn't change, and keep a copy of it
+sudo systemctl stop calor-api && cp /var/lib/calor/calor.db ~/calor-backup.db
+# 2. create the database (see Deployment), then import; the schema is created first
+make build-api
+./bin/calor-import-sqlite -sqlite /var/lib/calor/calor.db -database-url 'postgres:///calor?host=/run/postgresql'
+#    or: make import-sqlite SQLITE=/var/lib/calor/calor.db DATABASE_URL=…
+# 3. install the new binary and unit, then start it
+sudo systemctl daemon-reload && sudo systemctl start calor-api
+```
+
+The file is opened read-only. The importer refuses a database that already has events or
+sites. Rows are copied and verified in one transaction, so when anything fails no data is
+left behind (only the schema and empty monthly partitions) and the import can simply be
+re-run. 153k events take about 3 s. With Docker, run the importer on the host against
+the published or a temporarily exposed PostgreSQL port, or `docker cp` it into a container
+on the compose network.
 
 ## Setup caveats and known limits
 
@@ -432,8 +531,11 @@ Docker wasn't available in the environment where this was built.
   - The ingest endpoint is intentionally CORS `*`. The site and origin checks are what
     keep foreign traffic out.
 - **Versions.**
-  - Go 1.22 is enough. `modernc.org/sqlite` is pinned to v1.34.5 because newer releases
-    need a newer Go toolchain; with a newer Go you can upgrade it.
+  - Go 1.22 is enough. `pgx` is pinned to v5.7.4 and `modernc.org/sqlite` (used only by
+    `calor-import-sqlite`) to v1.34.5, because newer releases need a newer Go toolchain;
+    with a newer Go you can upgrade both.
+  - PostgreSQL 16 or newer (tested with 16.15). The schema uses declarative partitioning
+    and `DETACH PARTITION … CONCURRENTLY` (14+); 16 is what the Docker setup pins.
   - Next.js 16 needs Node ≥ 20.9.
 - **Screenshots** are not taken automatically.
   - Upload one per page from the page-detail view, or with `PUT
@@ -442,13 +544,17 @@ Docker wasn't available in the environment where this was built.
     allows framing) or a grid.
   - Heatmap positions are relative to document size, so pages that change layout a lot
     between devices are best viewed with the device filter.
-- **Large sites.** On a single site with about 1.3M events in the selected range, the
-  heavy aggregations (KPIs, elements, pages, entry/exit) take 2–4 s each with pure-Go
-  SQLite.
+- **Large sites.** The heavy aggregations (elements, pages, daily, KPIs) scan every event
+  of the site in the selected range: about 0.4–0.9 s at 270k events, growing linearly.
   - Results are cached for 15 s, and heatmaps use the rollup and stay fast.
-  - Shorter ranges, `CALOR_RETENTION_DAYS`, or a larger cache help.
-- **Deleting a site** removes its data in bounded transactions. For very large sites it
-  can take a while, and the database file doesn't shrink until you run `VACUUM`.
+  - Shorter ranges, `CALOR_RETENTION_DAYS`, or more `shared_buffers`/`work_mem` help.
+- **Deleting a site** removes its data in bounded transactions, so it can take a while for
+  very large sites. Autovacuum makes the space reusable; the files only shrink with
+  `VACUUM FULL` or when retention drops a month.
+- **Planner statistics.** A site created moments ago has no statistics until autovacuum
+  analyzes the table (within about a minute under load). The queries and indexes are
+  written so that this doesn't change their plans, but a manual `ANALYZE events` after a
+  big import or backfill does no harm.
 - **Docker** files are untested (see above). systemd and `make start` are the tested
   paths.
 - **Component tagging** has the limits listed in [its section](#component-tagging).

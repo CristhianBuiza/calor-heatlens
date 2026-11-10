@@ -87,9 +87,25 @@
   - Retention drops every month partition that is entirely older than the cutoff
     (`DETACH PARTITION … CONCURRENTLY`, then `DROP TABLE`), which costs nothing however
     many rows it held. Rows of the boundary month are deleted in 5,000-row transactions.
-  - Site and component deletion run in 5,000-row transactions too
-    (`DELETE … WHERE key IN (SELECT key … LIMIT 5000)`), so no single transaction holds
-    millions of row locks. Autovacuum reclaims the space; there is no checkpoint step.
+  - Site and component deletion run in 5,000-row transactions too, so no single
+    transaction holds millions of row locks. Each chunk selects up to 5,000 physical row
+    ids (`tableoid`, `ctid`) of matching rows and deletes them per partition with a TID
+    scan, re-checking the condition. Autovacuum reclaims the space; there is no checkpoint
+    step.
+- **Plans that survive stale statistics.** A site created since the last `ANALYZE` looks
+  empty to the planner. Two plans went badly wrong in that state during load tests, and
+  are written so that the estimate no longer matters:
+  - `DELETE … WHERE (id, ts) IN (SELECT … LIMIT 5000)` became a nested-loop semi-join over
+    every row of the site (minutes per chunk); hence the TID-based chunks above.
+  - The exit-point query finds each session's last click with a `LATERAL … ORDER BY ts
+    DESC, id DESC LIMIT 1` probe of `(site_id, type, pageview_id, ts, id)`. With a plain
+    `(pageview_id)` index the planner preferred a backward scan of `(site_id, type, ts)`
+    filtered by pageview, which reads every click of the site per pageview (90 s instead
+    of 0.2 s on 300k events).
+- **Result order.** Every ranked list breaks ties on its group keys (`ORDER BY clicks
+  DESC, selector, page_url, …`), and heatmap cells come sorted by cell. SQLite returned
+  ties in whatever order its sorter produced; on the seeded data the PostgreSQL build
+  returns byte-identical responses for all 705 dashboard API requests compared.
 
 ### `server/`: HTTP
 
