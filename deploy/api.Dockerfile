@@ -14,14 +14,13 @@ COPY tracker/ ./
 RUN npm run build
 
 FROM alpine:3.20
-RUN adduser -D -H calor && mkdir /data && chown calor /data
+RUN adduser -D -H calor
 COPY --from=api /out/calor-api /usr/local/bin/calor-api
 COPY --from=tracker /src/tracker/dist /srv/tracker
+# Set CALOR_DATABASE_URL (and PGPASSWORD) at run time; see docker-compose.yml.
 ENV CALOR_ADDR=:8080 \
-    CALOR_DB_PATH=/data/calor.db \
     CALOR_TRACKER_DIR=/srv/tracker \
     GOMEMLIMIT=192MiB
 USER calor
-VOLUME /data
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/calor-api"]

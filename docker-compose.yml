@@ -1,20 +1,48 @@
-# Low-memory deployment: both services fit in well under 1 GiB.
-#   CALOR_ADMIN_KEY=change-me docker compose up -d --build
+# Low-memory deployment for a 4 GB VPS: PostgreSQL (1 GiB cap), the API and
+# the dashboard (320 MiB each) together stay under 1.7 GiB.
+#   POSTGRES_PASSWORD=$(openssl rand -hex 24) CALOR_ADMIN_KEY=change-me docker compose up -d --build
 services:
+  postgres:
+    image: postgres:16.15-alpine3.24
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf", "-c", "listen_addresses=*"]
+    environment:
+      POSTGRES_DB: calor
+      POSTGRES_USER: calor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - calor-pg:/var/lib/postgresql/data
+      - ./deploy/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    # TCP check: the image's init phase runs a socket-only server first, so
+    # this only passes once the real server accepts connections.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U calor -d calor"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    mem_limit: 1g
+    memswap_limit: 1g
+    shm_size: 128m
+    stop_grace_period: 30s
+    restart: unless-stopped
+
   api:
     build:
       context: .
       dockerfile: deploy/api.Dockerfile
     environment:
       CALOR_ADMIN_KEY: ${CALOR_ADMIN_KEY:?set CALOR_ADMIN_KEY}
+      CALOR_DATABASE_URL: postgres://calor@postgres:5432/calor?sslmode=disable
+      PGPASSWORD: ${POSTGRES_PASSWORD}
       GOMEMLIMIT: 192MiB
       CALOR_RETENTION_DAYS: ${CALOR_RETENTION_DAYS:-90}
-    volumes:
-      - calor-data:/data
     ports:
       - "8080:8080"
     mem_limit: 320m
     memswap_limit: 320m
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   dashboard:
@@ -36,4 +64,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  calor-data:
+  calor-pg:

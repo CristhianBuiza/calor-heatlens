@@ -1,6 +1,7 @@
 [Unit]
 Description=Calor heatmap API
-After=network.target
+After=network.target postgresql.service
+Wants=postgresql.service
 
 [Service]
 Type=simple
@@ -11,13 +12,14 @@ ExecStart=/opt/calor/bin/calor-api
 # CALOR_ADMIN_KEY=... (and any overrides) live here, readable by root only.
 EnvironmentFile=/etc/calor/calor.env
 Environment=CALOR_ADDR=127.0.0.1:8080
-Environment=CALOR_DB_PATH=/var/lib/calor/calor.db
+# Local PostgreSQL over its Unix socket with peer authentication: the calor
+# OS user maps to the calor role, so no password is needed.
+Environment=CALOR_DATABASE_URL=postgres:///calor?host=/run/postgresql
 Environment=CALOR_TRACKER_DIR=/opt/calor/tracker/dist
 Environment=GOMEMLIMIT=192MiB
 Environment=CALOR_RETENTION_DAYS=90
-StateDirectory=calor
-# Go heap is capped by GOMEMLIMIT and SQLite by CALOR_SQLITE_HEAP_MB (64);
-# measured peak under the bundled load test is ~150 MiB RSS.
+# The Go heap is capped by GOMEMLIMIT; the database runs in its own
+# postgresql.service with its own memory settings.
 MemoryHigh=256M
 MemoryMax=320M
 TasksMax=64
@@ -27,7 +29,6 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/var/lib/calor
 
 [Install]
 WantedBy=multi-user.target

@@ -1,6 +1,7 @@
 // Command calor-loadtest drives concurrent ingest batches and dashboard
 // queries against a running API and reports throughput, latency and (with
-// -pid) the API process's resident memory sampled from /proc.
+// -pid) the API process's resident memory sampled from /proc; -pg adds the
+// memory of the local PostgreSQL server.
 package main
 
 import (
@@ -62,6 +63,41 @@ func rssKB(pid int, field string) int {
 	return 0
 }
 
+// pgMemKB sums the memory of every local postgres process (postmaster,
+// backends, background workers). PSS splits shared buffers between the
+// processes that map them, so the sum is not inflated by shared memory;
+// reading it needs the postgres user or root, otherwise RSS is summed.
+func pgMemKB() (kb int, field string) {
+	dirs, _ := os.ReadDir("/proc")
+	pss, rss := 0, 0
+	pssOK := true
+	for _, d := range dirs {
+		pid, err := strconv.Atoi(d.Name())
+		if err != nil {
+			continue
+		}
+		comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		if err != nil || strings.TrimSpace(string(comm)) != "postgres" {
+			continue
+		}
+		rss += rssKB(pid, "VmRSS")
+		if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/smaps_rollup", pid)); err == nil {
+			for _, line := range strings.Split(string(b), "\n") {
+				if f := strings.Fields(line); len(f) >= 2 && f[0] == "Pss:" {
+					n, _ := strconv.Atoi(f[1])
+					pss += n
+				}
+			}
+		} else {
+			pssOK = false
+		}
+	}
+	if pssOK && pss > 0 {
+		return pss, "PSS"
+	}
+	return rss, "RSS"
+}
+
 func main() {
 	api := flag.String("api", "http://127.0.0.1:8080", "API base URL")
 	key := flag.String("key", os.Getenv("CALOR_ADMIN_KEY"), "admin key")
@@ -72,6 +108,7 @@ func main() {
 	pages := flag.Int("pages", 40, "distinct pages")
 	pid := flag.Int("pid", 0, "API pid to sample RSS from /proc")
 	keep := flag.Bool("keep", false, "keep the loadtest site and its events afterwards")
+	pgMem := flag.Bool("pg", false, "also sample the summed memory of local postgres processes")
 	flag.Parse()
 
 	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: 64}}
@@ -98,14 +135,18 @@ func main() {
 	var ing, qry stats
 	var events atomic.Int64
 	var throttled atomic.Int64
-	var maxRSS, startRSS int
+	var maxRSS, startRSS, maxPG, startPG int
+	var pgField string
 	if *pid > 0 {
 		startRSS = rssKB(*pid, "VmRSS")
+	}
+	if *pgMem {
+		startPG, pgField = pgMemKB()
 	}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 
-	if *pid > 0 {
+	if *pid > 0 || *pgMem {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -116,8 +157,13 @@ func main() {
 				case <-stop:
 					return
 				case <-t.C:
-					if v := rssKB(*pid, "VmRSS"); v > maxRSS {
+					if v := rssKB(*pid, "VmRSS"); *pid > 0 && v > maxRSS {
 						maxRSS = v
+					}
+					if *pgMem {
+						if v, _ := pgMemKB(); v > maxPG {
+							maxPG = v
+						}
 					}
 				}
 			}
@@ -195,7 +241,7 @@ func main() {
 				if strings.Contains(q, "?") {
 					sep = "&"
 				}
-				// Unique cache-busting parameter so every query hits SQLite.
+				// Unique cache-busting parameter so every query hits the database.
 				req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/sites/%s/%s%stz=%d", *api, site, q, sep, i%600), nil)
 				req.Header.Set("Authorization", "Bearer "+*key)
 				req.Header.Set("Accept-Encoding", "gzip")
@@ -226,5 +272,10 @@ func main() {
 	if *pid > 0 {
 		fmt.Printf("api RSS             start %.1f MiB, peak sampled %.1f MiB, VmHWM %.1f MiB, end %.1f MiB\n",
 			float64(startRSS)/1024, float64(maxRSS)/1024, float64(rssKB(*pid, "VmHWM"))/1024, float64(rssKB(*pid, "VmRSS"))/1024)
+	}
+	if *pgMem {
+		end, _ := pgMemKB()
+		fmt.Printf("postgres %s sum    start %.1f MiB, peak sampled %.1f MiB, end %.1f MiB\n",
+			pgField, float64(startPG)/1024, float64(maxPG)/1024, float64(end)/1024)
 	}
 }

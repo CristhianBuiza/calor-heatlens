@@ -366,18 +366,20 @@ func (s *Store) ExitPoints(ctx context.Context, f Filter, limit int) ([]ExitPoin
 					ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ts DESC, id DESC) AS rn
 				FROM events`+c.sql()+`
 			) ranked WHERE rn = 1 AND (?::text = '' OR page_url = ?)
-		), last_click AS (
-			SELECT e.pageview_id, e.selector, e.el_label, e.el_text, e.el_id, e.el_tag,
-				ROW_NUMBER() OVER (PARTITION BY e.pageview_id ORDER BY e.ts DESC, e.id DESC) AS rn
-			FROM events e JOIN last_pv l ON e.pageview_id = l.pageview_id
-			WHERE e.site_id = ? AND e.type = 'click'
 		)
 		SELECT l.page_url, COALESCE(lc.selector, ''), COALESCE(lc.el_label, ''), COALESCE(lc.el_text, ''),
 			COALESCE(lc.el_id, ''), COALESCE(lc.el_tag, ''), COUNT(*),
 			(SUM(COUNT(*)) OVER ())::bigint
-		FROM last_pv l LEFT JOIN last_click lc ON lc.pageview_id = l.pageview_id AND lc.rn = 1
+		FROM last_pv l LEFT JOIN LATERAL (
+			-- A per-pageview probe of idx_events_pageview. The planner can't
+			-- estimate last_pv, and a window-ranked join turned into a nested
+			-- loop over every click.
+			SELECT e.selector, e.el_label, e.el_text, e.el_id, e.el_tag FROM events e
+			WHERE e.pageview_id = l.pageview_id AND e.site_id = ? AND e.type = 'click'
+			ORDER BY e.ts DESC, e.id DESC LIMIT 1
+		) lc ON true
 		GROUP BY 1, 2, 3, 4, 5, 6
-		ORDER BY 7 DESC, 1, 2 LIMIT ?`, args...)
+		ORDER BY 7 DESC, 1, 2, 3, 4, 5, 6 LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -680,7 +682,7 @@ func (s *Store) Devices(ctx context.Context, f Filter) ([]DeviceStat, error) {
 	rows, err := s.query(ctx, `SELECT
 		CASE WHEN viewport_w <= 0 THEN 'unknown' WHEN viewport_w < 768 THEN 'mobile' WHEN viewport_w < 1024 THEN 'tablet' ELSE 'desktop' END AS dev,
 		COUNT(*) FILTER (WHERE type = 'pageview'), COUNT(DISTINCT session_id), COUNT(*) FILTER (WHERE type = 'click')
-		FROM events`+c.sql()+` GROUP BY dev ORDER BY 2 DESC`, c.args...)
+		FROM events`+c.sql()+` GROUP BY dev ORDER BY 2 DESC, 1`, c.args...)
 	if err != nil {
 		return nil, err
 	}
@@ -754,7 +756,7 @@ func (s *Store) Elements(ctx context.Context, f Filter, limit, offset int) (Elem
 		COALESCE(AVG(x / NULLIF(doc_w, 0)), 0), COALESCE(AVG(y / NULLIF(doc_h, 0)), 0)
 		FROM events`+c.sql()+`
 		GROUP BY page_url, selector, el_tag, el_id, el_classes, el_text, el_label
-		ORDER BY 8 DESC, 2 LIMIT ? OFFSET ?`, args...)
+		ORDER BY 8 DESC, 2, 1, 3, 4, 5, 6, 7 LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return ElementList{}, err
 	}
@@ -801,7 +803,7 @@ func (s *Store) Flow(ctx context.Context, f Filter, limit int) (Flow, error) {
 	c := f.base(true)
 	c.add("type = 'pageview'")
 	rows, err := s.query(ctx, `SELECT referrer, nav_kind, COUNT(*), (SUM(COUNT(*)) OVER ())::bigint
-		FROM events`+c.sql()+` GROUP BY referrer, nav_kind ORDER BY 3 DESC LIMIT ?`, append(c.args, limit)...)
+		FROM events`+c.sql()+` GROUP BY referrer, nav_kind ORDER BY 3 DESC, 1, 2 LIMIT ?`, append(c.args, limit)...)
 	if err != nil {
 		return out, err
 	}
@@ -830,7 +832,7 @@ func (s *Store) Flow(ctx context.Context, f Filter, limit int) (Flow, error) {
 	c.add("type = 'navigation'")
 	c.add("nav_kind IN ('link','pushstate','replacestate','popstate')")
 	rows, err = s.query(ctx, `SELECT target_url, nav_kind, COUNT(*), (SUM(COUNT(*)) OVER ())::bigint
-		FROM events`+c.sql()+` GROUP BY target_url, nav_kind ORDER BY 3 DESC LIMIT ?`, append(c.args, limit)...)
+		FROM events`+c.sql()+` GROUP BY target_url, nav_kind ORDER BY 3 DESC, 1, 2 LIMIT ?`, append(c.args, limit)...)
 	if err != nil {
 		return out, err
 	}
@@ -983,7 +985,7 @@ func (s *Store) Heatmap(ctx context.Context, f Filter, cols, rows int) (Heatmap,
 			c.add("device = ?", f.Device)
 		}
 		q = `SELECT LEAST(gx * ?::integer / ` + itoa(RollupCols) + `, ?::integer - 1) AS cx, LEAST(gy * ?::integer / ` + itoa(RollupRows) + `, ?::integer - 1) AS cy, SUM(n)
-			FROM heatmap_rollup` + c.sql() + ` GROUP BY cx, cy`
+			FROM heatmap_rollup` + c.sql() + ` GROUP BY cx, cy ORDER BY cx, cy`
 		args = append([]any{cols, cols, rows, rows}, c.args...)
 	} else {
 		h.Source = "raw"
@@ -991,7 +993,7 @@ func (s *Store) Heatmap(ctx context.Context, f Filter, cols, rows int) (Heatmap,
 		c.add("type IN ("+placeholders(len(types))+")", toAny(types)...)
 		c.add("x IS NOT NULL AND x >= 0 AND y >= 0 AND doc_w > 0 AND doc_h > 0")
 		q = `SELECT LEAST(trunc(x * ?::integer / doc_w)::integer, ?::integer - 1) AS cx, LEAST(trunc(y * ?::integer / doc_h)::integer, ?::integer - 1) AS cy, COUNT(*)
-			FROM events` + c.sql() + ` GROUP BY cx, cy`
+			FROM events` + c.sql() + ` GROUP BY cx, cy ORDER BY cx, cy`
 		args = append([]any{cols, cols, rows, rows}, c.args...)
 	}
 	rs, err := s.query(ctx, q, args...)

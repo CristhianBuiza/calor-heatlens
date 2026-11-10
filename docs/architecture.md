@@ -3,7 +3,7 @@
 ## Data flow
 
 ```
- visitor's browser                      calor-api (Go, one static binary)                 SQLite (WAL)
+ visitor's browser                      calor-api (Go, one static binary)                 PostgreSQL 16
 ┌──────────────────────┐  sendBeacon   ┌───────────────────────────────────────────┐     ┌────────────────────┐
 │ calor.min.js         │ ────────────▶ │ POST /api/events                          │     │ sites              │
 │  clicks, navigations │  text/plain   │  validate · site + Origin check           │     │ events             │
@@ -11,7 +11,7 @@
 └──────────────────────┘               │   (coalesces batches into one tx)         │     │ screenshots        │
                                        │                                           │     │ components *       │
  dashboard server (Next.js)            │ GET /api/sites/{site}/…  (admin key)      │ ◀── │ event_components * │
-┌──────────────────────┐  HTTP + key   │  2 read-only connections · response cache │     └────────────────────┘
+┌──────────────────────┐  HTTP + key   │  read pool (4) · response cache           │     └────────────────────┘
 │ server components    │ ◀───────────▶ │  (TTL + LRU, gzip, per-site invalidation) │
 │ SVG charts, heatmap  │               └───────────────────────────────────────────┘     * component tagging
 └──────────▲───────────┘
@@ -32,33 +32,64 @@
     adds a `<base>` tag, sends `Content-Security-Policy: script-src 'none'`, and caps the
     size at 3 MiB. The result is shown in a sandboxed same-origin iframe, so the picker
     can read its DOM without running the site's code.
-- The **API** is the only process that touches SQLite.
+- The **API** is the only process that touches the database (PostgreSQL, through
+  [pgx v5](https://pkg.go.dev/github.com/jackc/pgx/v5)). `calor-import-sqlite` copies a
+  database from the SQLite era into it once.
 
 ## API internals (`api/internal`)
 
 ### `store/`: schema, writes and every aggregation
 
-- **Database handles.**
-  - Two `*sql.DB` handles on one file: a single writer connection, and a small pool of
-    `query_only` readers (default 2).
-  - Pragmas: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`,
-    `foreign_keys=ON`, `cache_size` (default 4 MiB per connection), `mmap_size` (default
-    0), `journal_size_limit=64 MiB`, `temp_store=FILE`, and `soft_heap_limit` (default
-    64 MiB).
-- **Migrations** are numbered and tracked in `PRAGMA user_version`.
+- **Connection pools.** Two `pgxpool` pools on one DSN (`CALOR_DATABASE_URL`):
+  - a write pool (`CALOR_DB_WRITE_CONNS`, default 2) used by the ingest writer, site
+    and component changes, retagging and retention;
+  - a read pool (`CALOR_DB_READ_CONNS`, default 4) for every aggregation. Its sessions
+    run with `default_transaction_read_only=on`, so a read query can never write.
+  - Both set `application_name=calor-api` and close connections idle for 5 minutes. SQL
+    is written with `?` placeholders and rebound to `$n` in one place.
+- **Migrations** are embedded SQL files (`store/migrations/NNNN_name.sql`) applied at
+  startup, each in its own transaction, under a Postgres advisory lock so concurrent
+  starts don't race. Applied versions are recorded in `schema_migrations`. The API
+  refuses to start against a schema newer than the binary.
+- **Types.** Times stay `bigint` Unix milliseconds, as on the wire and in every API
+  response. Time-zone bucketing is integer arithmetic on them (`(ts + tz*60000) /
+  86400000`), which is how the SQLite queries worked too. Flags are `boolean`; positions
+  and scroll depth `double precision`; screenshots `bytea` (stored out of line,
+  uncompressed, since images are already compressed). Text keys use `COLLATE "C"`, so
+  sort order and tie-breaks match the byte order SQLite used. Nothing stored is JSON, so
+  there is no `jsonb`.
 - **Tables:**
-  - `events`: one row per click, navigation, pageview or scroll summary. Indexed on
-    (site, type, ts), (site, page, type, ts), (site, session, ts) and (pageview).
+  - `events`: one row per click, navigation, pageview or scroll summary. **Partitioned
+    by month** on `ts` (`events_y2026m11`, …). Indexed on (site, type, ts), (site, page,
+    type, ts), (site, session, ts) and (pageview), plus a BRIN index on `ts`. The
+    primary key is (id, ts), because a partitioned table's unique keys must include the
+    partition key; ids still come from one identity sequence.
   - `heatmap_rollup`: per site, page, type, device and hour, counts on a fixed 200×800
     grid of document-relative cells. A heatmap reads a few thousand cells instead of
     every click.
   - `screenshots`: one image per site and page.
-  - `components` and `event_components` (component tagging, below).
+  - `components` and `event_components` (component tagging, below). `event_components`
+    is partitioned by month like `events`.
+- **Partitions** are created on demand: the writer creates the month of every event in
+  a batch before copying it (a cached set makes that free in the common case), and the
+  hourly job pre-creates this month and next. There is no default partition, so an
+  event can never land somewhere retention can't drop.
 - **Aggregations** are plain SQL: window functions for entry/exit and bounce, per
   pageview max scroll depth, and gap-filled daily series. Labels and element grouping
   are assembled in Go.
-- **Deletes** (site deletion, retention pruning) run in 5,000-row transactions followed
-  by `wal_checkpoint(TRUNCATE)`, so the WAL never grows to the size of one big delete.
+- **Writes.** Each writer batch is one transaction with `synchronous_commit = off` (the
+  equivalent of SQLite's `synchronous=NORMAL`: a crash can lose the last few hundred
+  milliseconds of events, never corrupt). Event ids are reserved from the sequence in
+  one round trip, events and their component tags are loaded with `COPY`, and the
+  heatmap rollup is aggregated in Go and upserted in one `INSERT … SELECT FROM unnest(…)
+  ON CONFLICT DO UPDATE` sorted by key, so concurrent upserts can't deadlock.
+- **Deletes.**
+  - Retention drops every month partition that is entirely older than the cutoff
+    (`DETACH PARTITION … CONCURRENTLY`, then `DROP TABLE`), which costs nothing however
+    many rows it held. Rows of the boundary month are deleted in 5,000-row transactions.
+  - Site and component deletion run in 5,000-row transactions too
+    (`DELETE … WHERE key IN (SELECT key … LIMIT 5000)`), so no single transaction holds
+    millions of row locks. Autovacuum reclaims the space; there is no checkpoint step.
 
 ### `server/`: HTTP
 
@@ -68,7 +99,7 @@
   - When the queue is full it returns 503 with `Retry-After`, rather than buffering
     without limit.
   - A single writer goroutine flushes every 200 ms or at 5,000 events per transaction.
-- **Site registry:** in memory, so ingest never queries SQLite to validate a site.
+- **Site registry:** in memory, so ingest never queries the database to validate a site.
 - **Response cache:** TTL + LRU. Keys include a per-site generation number that is
   bumped on ingest and on site or component changes. A gzip copy is built lazily and
   kept.
@@ -78,12 +109,18 @@
 - **`calor-api`:**
   - Reads environment configuration and sets `debug.SetMemoryLimit` (192 MiB) when
     `GOMEMLIMIT` is unset.
-  - Runs the optional hourly retention job, sets HTTP timeouts, and shuts down
-    gracefully.
+  - Connects with retries (`CALOR_DB_CONNECT_TIMEOUT_SEC`, so it can start before the
+    database is ready), applies migrations, and runs the hourly maintenance job:
+    pre-create partitions and, with `CALOR_RETENTION_DAYS`, prune. Sets HTTP timeouts
+    and shuts down gracefully.
+- **`calor-import-sqlite`:** one-shot copy of a SQLite `calor.db` (schema 1 or 2) into an
+  empty PostgreSQL database, in one transaction, keeping ids; then verifies row counts
+  and checksums. See the README's upgrade section.
 - **`calor-loadtest`:**
   - Concurrent ingest and cache-busting query workers against a fresh `loadtest` site,
     which is deleted afterwards.
-  - Reports latency percentiles and samples the API's RSS from `/proc`.
+  - Reports latency percentiles and samples the API's RSS from `/proc`. With `-pg` it
+    also samples the summed memory (PSS) of the local PostgreSQL processes.
 
 ## Tracker (`tracker/src/calor.js`)
 
@@ -130,15 +167,14 @@ component existed.
   matches.
 - It can be limited to pages by a path pattern with `*` wildcards (`/products/*`).
 
-**Storage** (schema version 2, applied as one transaction; adding a column with a constant
-default is instant even on large databases):
+**Storage** (part of the initial PostgreSQL schema, `0001_init.sql`):
 
 - `components(id, site_id, name, selector, attr_name, attr_value, page_pattern,
   created_at, updated_at)`, with a foreign key to `sites` (`ON DELETE CASCADE`).
-- `event_components(component_id, ts, event_id)`, a `WITHOUT ROWID` junction whose
-  primary key starts with the component and time, so a component-scoped query is a range
-  scan. It has no foreign keys; component and site deletes remove its rows in bounded
-  chunks.
+- `event_components(component_id, ts, event_id)`, a junction whose primary key starts
+  with the component and time, so a component-scoped query is a range scan of the
+  index. It is partitioned by month like `events` and has no foreign keys; component and
+  site deletes remove its rows in bounded chunks, and retention drops its partitions.
 - `events.el_component` holds the closest `data-calor-component` value of each click.
 
 **Matching runs in three places, and the results are unioned:**

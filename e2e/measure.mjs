@@ -1,6 +1,7 @@
 // Resource report for a running stack: tracker size, dashboard JS per route
 // (scripts the browser actually loads, sized from the build output), and the
-// RSS of the API and dashboard processes before/after loading every route.
+// RSS of the API and dashboard processes (plus the summed memory of a local
+// PostgreSQL server, if one runs on this machine) before/after loading every route.
 //   node measure.mjs  -> prints a summary, writes output/measure.json
 import { execSync } from 'node:child_process';
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
@@ -24,6 +25,27 @@ function mem(p) {
   const s = readFileSync(`/proc/${p}/status`, 'utf8');
   const get = (k) => Math.round(Number(s.match(new RegExp(`${k}:\\s+(\\d+)`))[1]) / 1024);
   return { rssMiB: get('VmRSS'), peakMiB: get('VmHWM') };
+}
+// Sum over every local postgres process. PSS shares shared_buffers out
+// between the processes mapping them; it needs the postgres user or root,
+// otherwise RSS (which counts shared memory once per process) is summed.
+function pgMem() {
+  let pss = 0, rss = 0, pssOk = true, n = 0;
+  for (const d of readdirSync('/proc')) {
+    if (!/^\d+$/.test(d)) continue;
+    try {
+      if (readFileSync(`/proc/${d}/comm`, 'utf8').trim() !== 'postgres') continue;
+      rss += Number(readFileSync(`/proc/${d}/status`, 'utf8').match(/VmRSS:\s+(\d+)/)[1]);
+      n++;
+      try {
+        pss += Number(readFileSync(`/proc/${d}/smaps_rollup`, 'utf8').match(/Pss:\s+(\d+)/)[1]);
+      } catch {
+        pssOk = false;
+      }
+    } catch {}
+  }
+  if (!n) return null;
+  return pssOk ? { pssMiB: Math.round(pss / 1024), processes: n } : { rssSumMiB: Math.round(rss / 1024), processes: n };
 }
 function walk(dir, out = []) {
   for (const f of readdirSync(dir)) {
@@ -51,7 +73,7 @@ async function main() {
   report.dashboardStatic = { js: sum('.js'), css: sum('.css') };
   report.standaloneBytes = Number(execSync(`du -sb ${join(root, 'dashboard/.next/standalone')}`).toString().split('\t')[0]);
 
-  report.memBefore = { api: mem(apiPid), dashboard: mem(dashPid) };
+  report.memBefore = { api: mem(apiPid), dashboard: mem(dashPid), postgres: pgMem() };
   const home = encodeURIComponent(`http://acme.localhost:${DEMO_PORT}/`);
   const routes = {
     overview: '/s/acme-coffee',
@@ -79,7 +101,7 @@ async function main() {
     }
   }
   await browser.close();
-  report.memAfter = { api: mem(apiPid), dashboard: mem(dashPid) };
+  report.memAfter = { api: mem(apiPid), dashboard: mem(dashPid), postgres: pgMem() };
 
   mkdirSync('output', { recursive: true });
   writeFileSync('output/measure.json', JSON.stringify(report, null, 2));
