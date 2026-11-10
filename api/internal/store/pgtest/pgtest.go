@@ -34,7 +34,7 @@ func DSN(t testing.TB) string {
 		defer cancel()
 		conn, err := pgx.Connect(ctx, base)
 		if err != nil {
-			t.Fatalf("connect to %s: %v", EnvVar, err)
+			t.Fatalf("connect to %s: %v\n(start one with `make db`, or unset %s to skip the database tests)", EnvVar, err, EnvVar)
 		}
 		defer conn.Close(ctx)
 		if _, err := conn.Exec(ctx, sql); err != nil {
